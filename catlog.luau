@@ -20,7 +20,7 @@ for _, arg in process.args do
     if k then
         if v:sub(1,1) == "'" and v:sub(-1) == "'" then v = v:sub(2, -2)
         elseif v:sub(1,1) == '"' and v:sub(-1) == '"' then v = v:sub(2, -2) end
-        Settings[k] = if v == "true" then true elseif v == "false" then false elseif tonumber(v) then tonumber(v) else v
+        Settings[k] = if v == "true" then true elseif v == "false" then false elseif tonumber(v) ~= nil then tonumber(v) else v
     else
         local val = arg
         if val:sub(1,1) == "'" and val:sub(-1) == "'" then val = val:sub(2, -2)
@@ -74,10 +74,11 @@ local function resolveApiDumpPath(): string?
     local cwd = process.cwd or ""
     for _ = 1, 6 do
         if cwd == "" then break end
-        local candidate = cwd .. "/" .. API_DUMP_PATH
+        local sep = if cwd:match("\\") then "\\" else "/"
+        local candidate = cwd .. sep .. API_DUMP_PATH
         local ok = pcall(fs.readFile, candidate)
         if ok then return candidate end
-        local parent = cwd:match("(.*)/[^/]*")
+        local parent = cwd:match("(.*)[/\\][^/\\]*")
         if not parent or parent == cwd then break end
         cwd = parent
     end
@@ -661,17 +662,6 @@ local function makeDataProxy(ctorName, ctorArgs, name)
                 local aa = rawget(a, "_ctorArgs") or {}
                 local ba = type(b) == "table" and rawget(b, "_ctorArgs") or {}
                 if aa and ba and aa[1] and ba[1] then
-                    return makeDataProxy(rawget(a, "_ctorName") or "Vector3", {aa[1]+ba[1], aa[2]+ba[2], aa[3]+ba[3]}, (rawget(a,"_name") or "v").."+")
-                end
-                if aa and type(b) == "number" then
-                    return makeDataProxy(rawget(a, "_ctorName") or "Vector3", {aa[1]+b, aa[2]+b, aa[3]+b}, (rawget(a,"_name") or "v").."+")
-                end
-                return makeProxy("v")
-            end,
-            __sub = function(a, b)
-                local aa = rawget(a, "_ctorArgs") or {}
-                local ba = type(b) == "table" and rawget(b, "_ctorArgs") or {}
-                if aa and ba and aa[1] and ba[1] then
                     return makeDataProxy(rawget(a, "_ctorName") or "Vector3", {aa[1]-ba[1], aa[2]-ba[2], aa[3]-ba[3]}, (rawget(a,"_name") or "v").."-")
                 end
                 if aa and type(b) == "number" then
@@ -915,7 +905,7 @@ local function fireAllConnectionsForEvent(proxyNameStr: string, eventName: strin
     for _, conn in ipairs(eventConnections) do
         local connProxyName = ""
         local m = getmetatable(conn.proxy)
-        if m and m._isProxy then connProxyName = m._name end
+        if m and m._isProxy then connProxyName = rawget(conn.proxy, "_name") or m._name or "" end
         if connProxyName == proxyNameStr and conn.eventName == eventName then
             pcall(conn.callback, table.unpack(args))
         end
