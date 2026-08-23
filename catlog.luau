@@ -5717,6 +5717,7 @@ local function createEnv()
     end
     env.loadstring = function(src, chunkname)
         if type(src) ~= "string" then return nil, "invalid argument #1 to 'loadstring'" end
+        if src == "" then return function() end end
         if src:find('require%("@lune') or src:find("require%('@lune") or src:find('require%("lfs') or src:find("require%('lfs") then
             return nil, "blocked: lune/lfs require"
         end
@@ -5726,20 +5727,20 @@ local function createEnv()
         end
         local ok, compiled = pcall(luau.compile, src, { optimizationLevel = 1 })
         if not ok then
-            return nil, tostring(compiled)
+            return function() end
         end
         local loadOk, fn = pcall(luau.load, compiled, { debugName = chunkname or "loadstring", environment = env })
         if not loadOk or type(fn) ~= "function" then
-            return nil, tostring(fn)
+            return function() end
         end
         return fn
     end
     env.load = function(src, chunkname, mode, envArg)
         if type(src) == "string" then
             local ok, compiled = pcall(luau.compile, src, { optimizationLevel = 1 })
-            if not ok then return nil, tostring(compiled) end
+            if not ok then return function() end end
             local loadOk, fn = pcall(luau.load, compiled, { debugName = chunkname or "load", environment = envArg or env })
-            if not loadOk or type(fn) ~= "function" then return nil, tostring(fn) end
+            if not loadOk or type(fn) ~= "function" then return function() end end
             return fn
         elseif type(src) == "function" then
             local chunks = {}
@@ -7438,6 +7439,36 @@ local function createEnv()
             if k == "ClassName" then return "DataModel" end
             if k == "JobId" then return "job-1234567" end
             if k == "GetJobsInfo" then return function() return {{name = "Heartbeat", dutyCycle = 0.01}, {name = "Stepped", dutyCycle = 0.01}, {name = "RenderSteps", dutyCycle = 0.02}} end end
+            if k == "HttpGet" or k == "HttpGetAsync" then
+                return function(self, url, cache)
+                    local vn = genVar("httpget")
+                    emit(string.format('local %s = game:HttpGet(%s)', vn, serialize(url)))
+                    return ""
+                end
+            end
+            if k == "HttpPost" then
+                return function(self, url, data, cache)
+                    local vn = genVar("httppost")
+                    emit(string.format('local %s = game:HttpPost(%s, %s)', vn, serialize(url), serialize(data)))
+                    return ""
+                end
+            end
+            if k == "HttpRequest" then
+                return function(self, req)
+                    local vn = genVar("httpreq")
+                    emit(string.format('local %s = game:HttpRequest(%s)', vn, serialize(req)))
+                    return ""
+                end
+            end
+            if k == "BindToClose" then return function(self, cb) end end
+            if k == "GetObjects" then return function(self, url) return {} end end
+            if k == "InsertObject" then return function(self, url) return makeProxy("Instance") end end
+            if k == "SetPlaceId" then return function(self, id) end end
+            if k == "SetUniverseId" then return function(self, id) end end
+            if k == "DefineFastFlag" then return function(self, name, val) end end
+            if k == "GetFastFlag" then return function(self, name) return false end end
+            if k == "GetFastInt" then return function(self, name) return 0 end end
+            if k == "GetFastString" then return function(self, name) return "" end end
             return nil
         end)
     end
@@ -8557,8 +8588,15 @@ local function dump(source: string): string
     local env = createEnv()
 
     local fn
+    local processedSource = source
+    processedSource = processedSource:gsub("for%s+([%w_,]+)%s+in%s+([%w_]+)%s+do", function(vars, expr)
+        if expr == "pairs" or expr == "ipairs" or expr == "next" then
+            return nil
+        end
+        return "for " .. vars .. " in pairs(" .. expr .. ") do"
+    end)
     local loadOk, loadErr = pcall(function()
-        local compiled = luau.compile(SANDBOX_PRELUDE .. source, { optimizationLevel = 2 })
+        local compiled = luau.compile(SANDBOX_PRELUDE .. processedSource, { optimizationLevel = 2 })
         fn = luau.load(compiled, { debugName = "envlog", environment = env })
     end)
     if not loadOk or not fn then
