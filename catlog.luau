@@ -5721,9 +5721,11 @@ local function createEnv()
         if src:find('require%("@lune') or src:find("require%('@lune") or src:find('require%("lfs') or src:find("require%('lfs") then
             return nil, "blocked: lune/lfs require"
         end
-        if #src > 5000 and src:sub(1, 5) == "local" then
-            src = src:gsub("repeat ", "repeat if _VMC() then error('VM_BUDGET') end ")
-            src = src:gsub("while true do", "while true do if _VMC() then error('VM_BUDGET') end ")
+        if #src > 100 then
+            local _budgetCheck = "if _VMC and _VMC() then error('VM_BUDGET') end "
+            src = src:gsub("repeat ", "repeat " .. _budgetCheck)
+            src = src:gsub("while%s+([%w_ %(%)<>=~]+)%s+do", "while %1 do " .. _budgetCheck)
+            src = src:gsub("for%s+([%w_,= ]+)%s+do", "for %1 do " .. _budgetCheck)
         end
         local ok, compiled = pcall(luau.compile, src, { optimizationLevel = 1 })
         if not ok then
@@ -7469,6 +7471,22 @@ local function createEnv()
             if k == "GetFastFlag" then return function(self, name) return false end end
             if k == "GetFastInt" then return function(self, name) return 0 end end
             if k == "GetFastString" then return function(self, name) return "" end end
+            if k == "DefineFastInt" then return function(self, name, val) end end
+            if k == "DefineFastString" then return function(self, name, val) end end
+            if k == "IsLoaded" then return function() return true end end
+            if k == "Load" then return function() end end
+            if k == "Shutdown" then return function() end end
+            if k == "GetPlaceVersion" then return function() return 1 end end
+            if k == "GetPlaceName" then return function() return "Place" end end
+            if k == "GetGenre" then return function() return Enum.Genre.All end end
+            if k == "CreatorId" then return 0 end
+            if k == "CreatorType" then return Enum.CreatorType.User end
+            if k == "PrivateServerId" then return "" end
+            if k == "PrivateServerOwnerId" then return 0 end
+            if k == "AnalyticsService" then return _game_proxy:GetService("AnalyticsService") end
+            if k == "GetSessionId" then return function() return "" end end
+            if k == "GetEngineFeatures" then return function() return {} end end
+            if k == "GetEngineFeature" then return function(self, name) return false end end
             return nil
         end)
     end
@@ -8589,12 +8607,29 @@ local function dump(source: string): string
 
     local fn
     local processedSource = source
+    
+    -- Strip leading comments
+    processedSource = processedSource:gsub("^%-%-[^\n]*\n?", "")
+    
+    -- If the source starts with "return(function(...) ... end)(...)" 
+    -- wrap the call result in pcall to prevent nil() crashes
+    -- but preserve varargs by wrapping differently
+    if processedSource:match("^return%s*%(function") then
+        -- Change "return(func)(args)" to "return pcall(func, args) or nil"
+        -- Actually, just let pcall(fn) at the outer level catch it
+        -- The issue is return(func(...)(...)) where func returns nil
+        -- We can't wrap in pcall because of varargs
+        -- Instead, make the outer pcall catch the error
+    end
+    
+    -- for-in table fix
     processedSource = processedSource:gsub("for%s+([%w_,]+)%s+in%s+([%w_]+)%s+do", function(vars, expr)
         if expr == "pairs" or expr == "ipairs" or expr == "next" then
             return nil
         end
         return "for " .. vars .. " in pairs(" .. expr .. ") do"
     end)
+    
     local loadOk, loadErr = pcall(function()
         local compiled = luau.compile(SANDBOX_PRELUDE .. processedSource, { optimizationLevel = 2 })
         fn = luau.load(compiled, { debugName = "envlog", environment = env })
@@ -8604,19 +8639,60 @@ local function dump(source: string): string
         return table.concat(lines, "\n")
     end
 
-    local INSN_BUDGET = 80000000
+    local INSN_BUDGET = 100000000
     local insnCount = 0
     local timedOut = false
     local wallLimit = tonumber(Settings.timeout) or 60
     local wallStart = os.clock()
 
+    -- Spawn a watchdog coroutine that kills the execution after wallLimit
+    local watchdogFired = false
+    local watchdog = task.delay(wallLimit, function()
+        watchdogFired = true
+        -- Force error to break out of pcall
+        pcall(function()
+            error("WALL_CLOCK_TIMEOUT", 0)
+        end)
+    end)
+
+    -- Override tick/wait inside env to check wall time
+    local realOsClock = os.clock
+    local _envRef = _G._envRef
+    if _envRef then
+        local _tickFn = function()
+            local elapsed = realOsClock() - wallStart
+            if elapsed > wallLimit then
+                error("WALL_CLOCK_TIMEOUT", 0)
+            end
+            return realOsClock()
+        end
+        pcall(function() rawset(_envRef, "tick", _tickFn) end)
+        pcall(function() rawset(_envRef, "time", _tickFn) end)
+        if type(_envRef.task) == "table" then
+            pcall(function() _envRef.task.wait = function(t)
+                local elapsed = realOsClock() - wallStart
+                if elapsed > wallLimit then error("WALL_CLOCK_TIMEOUT", 0) end
+                return 0
+            end end)
+            pcall(function() _envRef.task.gettime = _tickFn end)
+        end
+        pcall(function() rawset(_envRef, "wait", function(t)
+            local elapsed = realOsClock() - wallStart
+            if elapsed > wallLimit then error("WALL_CLOCK_TIMEOUT", 0) end
+            return 0
+        end) end)
+    end
+
     local ok, err = pcall(fn)
+    task.cancel(watchdog)
     if not ok then
         local errStr = tostring(err)
-        if not errStr:find(BUDGET_ERROR, 1, true) then
+        if errStr:find("WALL_CLOCK_TIMEOUT", 1, true) then
+            emit(string.format("-- Timeout after %.1fs", realOsClock() - wallStart))
+        elseif not errStr:find(BUDGET_ERROR, 1, true) then
             emit(string.format("-- Runtime error: %s", errStr:sub(1, 300)))
         else
-            emit(string.format("-- Budget reached after %d instructions / %.2fs", insnCount, os.clock() - wallStart))
+            emit(string.format("-- Budget reached after %d instructions / %.2fs", insnCount, realOsClock() - wallStart))
         end
     end
 
