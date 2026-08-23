@@ -7445,6 +7445,12 @@ local function createEnv()
                 return function(self, url, cache)
                     local vn = genVar("httpget")
                     emit(string.format('local %s = game:HttpGet(%s)', vn, serialize(url)))
+                    if type(url) == "string" and (url:find("^https?://") or url:find("^rbxasset://")) then
+                        local ok, res = pcall(net.request, url)
+                        if ok and res and res.statusCode == 200 and res.body and #res.body > 0 then
+                            return res.body
+                        end
+                    end
                     return ""
                 end
             end
@@ -7749,11 +7755,29 @@ local function createEnv()
 
     env.http_request = function(opts)
         if type(opts) ~= "table" then return {StatusCode=400, Body="", Success=false} end
+        local url = opts.Url or opts.url
+        if url and (url:find("^https?://") or url:find("^rbxasset://")) then
+            local netOpts = { method = opts.Method or "GET" }
+            if opts.Body then netOpts.body = opts.Body end
+            if opts.Headers then netOpts.headers = opts.Headers end
+            local ok, res = pcall(net.request, url, netOpts)
+            if ok and res then
+                return {StatusCode=res.statusCode or 200, Body=res.body or "", Success=(res.statusCode or 200) < 400, Headers=res.headers or {}}
+            end
+        end
         return {StatusCode=200, Body="", Success=true, Headers={}}
     end
     env.request = env.http_request
     env.httppost = env.http_request
-    env.httpget = function(url) return "" end
+    env.httpget = function(url)
+        if type(url) == "string" and (url:find("^https?://") or url:find("^rbxasset://")) then
+            local ok, res = pcall(net.request, url)
+            if ok and res and res.statusCode == 200 and res.body then
+                return res.body
+            end
+        end
+        return ""
+    end
     env.httpgetasync = env.httpget
 
     env.Drawing = setmetatable({
