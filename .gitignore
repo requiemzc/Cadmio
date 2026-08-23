@@ -1,7 +1,7 @@
-stuff/
-*.lua
 out.lua
 __pycache__/
 node_modules/
 dist/
 ignore/
+*.pyc
+.env
