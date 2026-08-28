@@ -499,6 +499,10 @@ local function isProxy(v: any): boolean
     return type(v) == "table" and getmetatable(v) ~= nil and getmetatable(v)._isProxy == true
 end
 
+-- Forward declarations (functions used before full definition)
+local ensureDeclared: (any) -> ()  -- declared properly below, used by proxyName/serialize
+local serialize: (any, number?) -> string
+
 local dataMTs = {}
 local function makeDataProxy(ctorName, ctorArgs, name)
     if not dataMTs[ctorName] then
@@ -698,6 +702,7 @@ end
 
 local function proxyName(v: any): string
     if isProxy(v) then
+        ensureDeclared(v)
         local name = rawget(v, "_name") or getmetatable(v)._name
         return name or "proxy"
     end
@@ -726,7 +731,44 @@ local function markUsed(v: any)
     end
 end
 
-local serialize: (any, number?) -> string
+-- Ensure that a proxy's declaration line has been emitted before it is used.
+-- For "silent" proxies (LocalPlayer, Character, services accessed via __index, etc.)
+-- we lazily emit the appropriate `local X = <expr>` line the first time the proxy
+-- is referenced as a method receiver, assignment target, or serialization value.
+function ensureDeclared(v: any)
+    if not isProxy(v) then return end
+    local mt = getmetatable(v)
+    if mt._declared then return end
+    mt._declared = true
+    local nm = rawget(v, "_name") or mt._name
+    if not nm then return end
+    local expr = mt._declaredExpr
+    if not expr then
+        if mt._silent then
+            -- Generic fallback: declare as a child of the parent if known
+            if mt._className and mt._parent then
+                local parentMt = getmetatable(mt._parent)
+                local parentName = parentMt and parentMt._name
+                if parentName and parentName ~= "" then
+                    expr = parentName .. ":FindFirstChild(" .. serialize(nm) .. ")"
+                end
+            end
+            if not expr then
+                -- Last resort: emit a basic Instance.new declaration so the var is at least valid
+                if mt._className then
+                    expr = string.format('Instance.new("%s")', mt._className)
+                end
+            end
+        else
+            -- Non-silent proxies were already declared at spyInstance time
+            return
+        end
+    end
+    if expr then
+        emit(string.format("local %s = %s", nm, expr))
+    end
+end
+
 function serialize(value: any, depth: number?): string
     depth = depth or 0
     if depth > 6 then return "nil" end
@@ -753,6 +795,7 @@ function serialize(value: any, depth: number?): string
         end
         if m and m._isProxy then
             markUsed(value)
+            ensureDeclared(value)
             local nm = rawget(value, "_name") or m._name
             return nm or "proxy"
         end
@@ -2490,6 +2533,9 @@ makeProxy = function(name: string): any
         _descriptive = false,
         _storedValues = storedValues,
         _setKeys = setKeys,
+        _declared = false,          -- whether a `local X = ...` line has been emitted for this proxy
+        _declaredExpr = nil :: string?, -- the expression to emit (e.g. 'game:GetService("Players").LocalPlayer')
+        _silent = false,            -- silent proxies: declared lazily when first referenced
     }
     mt.__index = function(t, k)
         tick()
@@ -2505,9 +2551,11 @@ makeProxy = function(name: string): any
         end
         if mt._className == "DataModel" and isApiServiceClass(ks) then
             if not serviceCache[ks] then
-                if SERVER_ONLY_SERVICES[ks] then
-                    error(ks .. " is not a valid member of DataModel \"DataModel\"", 2)
-                end
+                -- Note: previously this branch threw an error for SERVER_ONLY_SERVICES
+                -- (ServerStorage, ServerScriptService). That broke obfuscators
+                -- (Luraph, Ironbrew, etc.) that probe these services during
+                -- VM initialization. Now we return a permissive proxy so the
+                -- obfuscator's code can continue running.
                 local svc = spyInstance(ks, ks:lower(), true)
                 local svcMt = getmetatable(svc)
                 svcMt._className = ks
@@ -2515,6 +2563,7 @@ makeProxy = function(name: string): any
                 svcMt._setKeys["ClassName"] = true
                 svcMt._storedValues["Name"] = ks
                 svcMt._setKeys["Name"] = true
+                svcMt._declaredExpr = string.format('game:GetService("%s")', ks)
                 if ks == "Chat" then
                     local ugcParent = makeProxy("ugc")
                     local ugcMt = getmetatable(ugcParent)
@@ -2546,12 +2595,14 @@ makeProxy = function(name: string): any
             if not children[ks] then
                 local player = spyInstance("Player", "LocalPlayer", true)
                 local pmt = getmetatable(player)
+                pmt._declaredExpr = "game:GetService(\"Players\").LocalPlayer"
                 pmt._storedValues["Parent"] = t
                 pmt._setKeys["Parent"] = true
                 pmt._storedValues["UserId"] = 0
                 pmt._setKeys["UserId"] = true
                 local character = spyInstance("Model", "Character", true)
                 local charMt = getmetatable(character)
+                charMt._declaredExpr = "LocalPlayer.Character"
                 charMt._storedValues["Name"] = "CatmiO"
                 charMt._setKeys["Name"] = true
                 local humanoid = spyInstance("Humanoid", "Humanoid", true)
@@ -3050,9 +3101,20 @@ makeProxy = function(name: string): any
 
         local clsName = mt._className or "Instance"
         local instDisplayName = storedValues["Name"] or name or clsName
+        -- Previously: threw "X is not a valid member of Y 'Z'" and aborted.
+        -- This broke obfuscators that probe Instance properties aggressively.
+        -- Now we emit a comment (so the dump shows what was probed) and
+        -- return a permissive proxy so the obfuscator's code can continue.
         local errMessage = ks .. " is not a valid member of " .. clsName .. " \"" .. tostring(instDisplayName) .. "\""
         emit(string.format('-- %s', errMessage))
-        error(errMessage, 2)
+        local fallbackProxy = makeProxy(name .. "." .. ks)
+        local fbpMt = getmetatable(fallbackProxy)
+        fbpMt._className = "Instance"
+        fbpMt._storedValues["Name"] = ks
+        fbpMt._setKeys["Name"] = true
+        storedValues[ks] = fallbackProxy
+        setKeys[ks] = true
+        return fallbackProxy
     end
     mt.__newindex = function(t, k, v)
         tick()
@@ -3070,9 +3132,11 @@ makeProxy = function(name: string): any
         end
         storedValues[ks] = v
         setKeys[ks] = true
-        if ks == "Name" and type(v) == "string" then
-            mt._name = v
-        end
+        -- NOTE: We deliberately do NOT change mt._name when the user sets the "Name" property.
+        -- mt._name is the CODEGEN variable name (e.g. "inst1") used to refer to this proxy in
+        -- the output. Renaming it to the Instance.Name value (e.g. "MyUI") would break
+        -- subsequent references because the new name is not declared as a local variable.
+        -- If you want the user-facing Instance name, read mt._storedValues["Name"].
         if ks == "Parent" and v ~= nil and not isProxy(v) then
             error("attempt to set Parent to a non-Instance value", 2)
         end
@@ -3185,10 +3249,14 @@ makeProxy = function(name: string): any
         end
         if isProxy(v) then
             markUsed(v)
+            ensureDeclared(v)
+            ensureDeclared(t)
             emit(string.format('%s.%s = %s', name, ks, proxyName(v)))
         elseif type(v) == "function" then
+            ensureDeclared(t)
             emit(string.format('%s.%s = function() end', name, ks))
         else
+            ensureDeclared(t)
             emit(string.format('%s.%s = %s', name, ks, serialize(v)))
         end
         firePropertyChange(name, ks, v)
@@ -4913,6 +4981,8 @@ spyInstance = function(className: string, name: string?, silent: boolean?): any
     mt._setKeys["ClassName"] = true
     mt._storedValues["Name"] = className
     mt._setKeys["Name"] = true
+    mt._silent = silent == true
+    mt._declared = silent ~= true  -- non-silent proxies are already declared above
     applyClassDefaults(proxy, className)
     return proxy
 end
@@ -4967,7 +5037,10 @@ knownCFunctions[getmetatable] = true
 knownCFunctions[unpack] = true
 local function createEnv()
     env = {}
-    env._G = {}
+    env._G = setmetatable({}, {
+        __index = function(t, k) return env[k] end,
+        __newindex = function(t, k, v) env[k] = v end,
+    })
     env._ENV = env
     local function getFunctionWhat(f)
         if type(f) ~= "function" then
@@ -5760,6 +5833,12 @@ local function createEnv()
     env.game = spyInstance("DataModel", "game", true)
     env.Game = env.game
     local gameMt = getmetatable(env.game)
+    -- In real Roblox, `game.Name == "Game"` (special instance name).
+    -- The default spyInstance sets Name = className ("DataModel"), which
+    -- breaks detection tests that do `if tostring(game) == 'Game'`.
+    -- Override to match real Roblox behavior.
+    gameMt._storedValues["Name"] = "Game"
+    gameMt._setKeys["Name"] = true
     gameMt._storedValues["PlaceId"] = math.random(100000000, 2147483646)
     gameMt._setKeys["PlaceId"] = true
     local function randHex(n) local s = "" for _=1,n do s = s .. string.format("%x", math.random(0, 15)) end return s end
@@ -7161,19 +7240,60 @@ local function createEnv()
         end
     end
     local existingEnvMt = getmetatable(env)
+    local _missingGlobalsLog = {}
+    local _missingGlobalsSeen = {}
+    -- A chained stub: callable + indexable, returns itself. This handles
+    -- obfuscators that probe executor-specific APIs like
+    -- `make_read_only(t).field(args)` or `gethiddengui(name).Parent = x`.
+    -- The stub is truthy, callable, indexable, and iterable (as empty).
+    local _stub
+    _stub = setmetatable({}, {
+        __call = function(_, ...) return _stub end,
+        __index = function(_, k) return _stub end,
+        __newindex = function() end,
+        __tostring = function() return "cadmio-stub" end,
+        __len = function() return 0 end,
+        __pairs = function() return function() return nil end end,
+        __ipairs = function() return function() return nil end end,
+    })
     setmetatable(env, {
         __index = function(t, k)
             if hiddenFuncs[k] ~= nil then return hiddenFuncs[k] end
             if existingEnvMt and existingEnvMt.__index then
-                if type(existingEnvMt.__index) == "function" then return existingEnvMt.__index(t, k) end
-                return existingEnvMt.__index[k]
+                if type(existingEnvMt.__index) == "function" then
+                    local v = existingEnvMt.__index(t, k)
+                    if v ~= nil then return v end
+                else
+                    local v = existingEnvMt.__index[k]
+                    if v ~= nil then return v end
+                end
             end
-            return nil
+            -- Known executor-specific APIs that should pass-through:
+            -- `make_read_only(t)` should return t unchanged so chained
+            -- calls like `make_read_only(t).field` work.
+            if k == "make_read_only" then
+                return function(x) return x end
+            end
+            if k == "set_readonly" or k == "lock_table" or k == "locktable" then
+                return function(x) return x end
+            end
+            if k == "set_readonly_assert" or k == "isreadonly_assert" then
+                return function(x) return x end
+            end
+            -- Diagnostic: log missing globals (first occurrence only)
+            if type(k) == "string" and not _missingGlobalsSeen[k] then
+                _missingGlobalsSeen[k] = true
+                table.insert(_missingGlobalsLog, k)
+            end
+            -- Return the chained stub so chained calls don't crash.
+            return _stub
         end,
         __newindex = function(t, k, v)
             rawset(t, k, v)
         end,
     })
+    -- Expose the log so the post-run code can print it
+    env._missingGlobalsLog = _missingGlobalsLog
 
     for k, v in pairs(env) do
         if type(v) == "function" then
@@ -8178,17 +8298,81 @@ local function createEnv()
 end
 
 local function isGenericVar(name: string): boolean
-    return name:match("^v%d+$") ~= nil or name:match("^color%d+$") ~= nil or name:match("^inst%d+$") ~= nil
+    return name:match("^v%d+$") ~= nil
+        or name:match("^color%d+$") ~= nil
+        or name:match("^inst%d+$") ~= nil
+        or name:match("^udim%d+$") ~= nil
+        or name:match("^cframe%d+$") ~= nil
+        or name:match("^clone%d+$") ~= nil
+        or name:match("^genv%d+$") ~= nil
+        or name:match("^renv%d+$") ~= nil
+        or name:match("^drawing%d+$") ~= nil
+        or name:match("^httpget%d+$") ~= nil
+        or name:match("^httppost%d+$") ~= nil
+        or name:match("^httpreq%d+$") ~= nil
+        or name:match("^p2dcp%d+$") ~= nil
+        or name:match("^random%d+$") ~= nil
+        or name:match("^seccaps%d+$") ~= nil
+        or name:match("^sharedtable%d+$") ~= nil
+end
+
+-- Count actual usages of a variable name across all lines (robust, grep-based)
+local function countVarUsages(varName: string): number
+    local count = 0
+    -- %f is frontier; we look for the varName as a whole word
+    local pattern = "%f[%w_]" .. varName .. "%f[^%w_]"
+    for _, line in ipairs(lines) do
+        local n = 0
+        local s = line
+        -- count non-overlapping matches
+        local start = 1
+        while true do
+            local i, j = string.find(s, pattern, start)
+            if not i then break end
+            n += 1
+            start = j + 1
+        end
+        -- subtract 1 if this line is the declaration (we don't want to count the LHS of `local X = ...`)
+        local declLHS = string.match(line, "^local " .. varName .. " =")
+        if declLHS then
+            n = n - 1
+        end
+        count += n
+    end
+    return count
 end
 
 local function deadCodeElimination()
     local result = {}
     for _, line in ipairs(lines) do
         local v = string.match(line, "^local ([%a_][%w_]*%d+) = (.+)$")
-        if v and isGenericVar(v) and (usedVars[v] or 0) == 0 then
-            local expr = string.match(line, "^local [%a_][%w_]*%d+ = (.+)$")
-            if not expr:match("^Color3%.") and not expr:match("^Instance%.new") and not expr:match("^Vector3%.") then
-                table.insert(result, expr)
+        if v and isGenericVar(v) then
+            -- Use robust grep-based usage count (the old usedVars map was incomplete)
+            local uses = countVarUsages(v)
+            if uses == 0 then
+                -- Variable is declared but never referenced.
+                -- If the expression has side effects (Instance.new, Connect, etc.), keep it.
+                -- Otherwise drop it.
+                local expr = string.match(line, "^local [%a_][%w_]*%d+ = (.+)$")
+                if expr then
+                    local hasSideEffect = expr:match("^Instance%.new")
+                        or expr:match("^Color3%.")
+                        or expr:match("^Vector3%.")
+                        or expr:match("^UDim2%.")
+                        or expr:match("^CFrame%.")
+                        or expr:match(":Connect%(")
+                        or expr:match(":GetService%(")
+                        or expr:match("WaitForChild%(")
+                        or expr:match("^game%.")
+                        or expr:match("^workspace%.")
+                    if hasSideEffect then
+                        table.insert(result, line)
+                    else
+                        -- drop the unused var
+                    end
+                end
+            else
+                table.insert(result, line)
             end
         else
             table.insert(result, line)
@@ -8714,7 +8898,17 @@ local function dump(source: string): string
         if errStr:find("WALL_CLOCK_TIMEOUT", 1, true) then
             emit(string.format("-- Timeout after %.1fs", realOsClock() - wallStart))
         elseif not errStr:find(BUDGET_ERROR, 1, true) then
-            emit(string.format("-- Runtime error: %s", errStr:sub(1, 300)))
+            emit(string.format("-- Runtime error: %s", errStr:sub(1, 500)))
+            -- Diagnostic: include traceback (limited size)
+            local tb = debug.traceback("", 2)
+            if tb and #tb > 0 then
+                emit(string.format("-- Traceback (truncated):\n%s", tb:sub(1, 600)))
+            end
+            -- Print missing globals if any were probed
+            if env._missingGlobalsLog and #env._missingGlobalsLog > 0 then
+                emit(string.format("-- Missing globals probed (%d): %s",
+                    #env._missingGlobalsLog, table.concat(env._missingGlobalsLog, ", ")))
+            end
         else
             emit(string.format("-- Budget reached after %d instructions / %.2fs", insnCount, realOsClock() - wallStart))
         end
@@ -8738,17 +8932,104 @@ if Settings.ipt then
         process.exit(1)
     end
     local source = fs.readFile(Settings.ipt)
+
+    -- Auto-detect and decompress zstd-compressed inputs (magic bytes 0x28 0xB5 0x2F 0xFD)
+    local zstd_ok, zstd_mod = pcall(function()
+        local scriptPath = (debug.info(1, "s") or ""):match("^@(.+)$") or "catlog.luau"
+        local dir = scriptPath:match("(.*)/[^/]*$") or "."
+        local path = dir .. "/zstd.luau"
+        if fs.isFile(path) then
+            return require(path)
+        end
+        -- Try relative to CWD
+        if fs.isFile("zstd.luau") then
+            return require("./zstd.luau")
+        end
+        return nil
+    end)
+    if zstd_ok and zstd_mod and zstd_mod.isZstd(source) then
+        local decoded, decodeErr = zstd_mod.decompress(source)
+        if decoded then
+            source = decoded
+            stdio.write("-- decompressed zstd input (" .. tostring(#source) .. " bytes)\n")
+        else
+            stdio.write("Error: failed to decompress zstd input: " .. tostring(decodeErr) .. "\n")
+            process.exit(1)
+        end
+    end
+
     local result = dump(source)
+
+    -- Optional: compress output with zstd if Settings.zstd_out is true
+    if Settings.zstd_out == true and zstd_ok and zstd_mod then
+        local compressed = zstd_mod.compress(result, tonumber(Settings.zstd_level) or 3)
+        if compressed then
+            fs.writeFile(Settings.out, compressed)
+            stdio.write(string.format("Done! Output: %s (%d bytes compressed, %d lines source)\n",
+                Settings.out, #compressed, #lines))
+            process.exit(0)
+        end
+    end
+
     fs.writeFile(Settings.out, result)
     stdio.write(string.format("Done! Output: %s (%d bytes, %d lines)\n", Settings.out, #result, #lines))
     process.exit(0)
 end
 
+-- JSON-RPC mode: each line is a JSON object like {"script": "...", "zstd": true}
+-- If zstd is set, the script field may be a base64-encoded zstd blob.
 while true do
     local input = stdio.readLine()
     if not input or input == "" then break end
     local decoded = serde.decode("json", input)
-    local result = dump(decoded.script)
+    local source = decoded.script
+
+    -- Auto-detect zstd magic bytes on raw input
+    local zstd_ok, zstd_mod = pcall(function()
+        local scriptPath = (debug.info(1, "s") or ""):match("^@(.+)$") or "catlog.luau"
+        local dir = scriptPath:match("(.*)/[^/]*$") or "."
+        local path = dir .. "/zstd.luau"
+        if fs.isFile(path) then return require(path) end
+        if fs.isFile("zstd.luau") then return require("./zstd.luau") end
+        return nil
+    end)
+
+    if type(source) == "string" and zstd_ok and zstd_mod and zstd_mod.isZstd(source) then
+        local d, err = zstd_mod.decompress(source)
+        if d then source = d end
+    elseif type(source) == "string" and decoded.zstd_base64 == true then
+        -- decode base64 then decompress
+        if zstd_ok and zstd_mod then
+            -- Use net.urldecode or pure-Luau base64
+            local b64dec
+            local function b64decode(s)
+                local b = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+                local lookup = {}
+                for i = 1, #b do lookup[b:byte(i, i)] = i - 1 end
+                s = s:gsub("%s+", "")
+                local out = {}
+                local i = 1
+                while i <= #s do
+                    local c1 = lookup[s:byte(i, i)] or 0
+                    local c2 = lookup[s:byte(i+1, i+1)] or 0
+                    local c3 = lookup[s:byte(i+2, i+2)] or 0
+                    local c4 = lookup[s:byte(i+3, i+3)] or 0
+                    local n = c1 * 262144 + c2 * 4096 + c3 * 64 + c4
+                    local b1 = math.floor(n / 65536) % 256
+                    local b2 = math.floor(n / 256) % 256
+                    local b3 = n % 256
+                    table.insert(out, string.char(b1, b2, b3))
+                    i += 4
+                end
+                return table.concat(out)
+            end
+            local bin = b64decode(source)
+            local d = zstd_mod.decompress(bin)
+            if d then source = d end
+        end
+    end
+
+    local result = dump(source)
     stdio.write(result)
     stdio.write("\n---END---\n")
 end

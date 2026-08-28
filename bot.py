@@ -5,18 +5,30 @@ import asyncio
 import tempfile
 import subprocess
 import re
+import sys
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 import aiohttp
 
+# Make the cadmio_postproc module importable whether the bot is run from
+# its own directory or from elsewhere. cadmio_postproc.py provides:
+#   - minify_lua()          : strip comments + redundant whitespace
+#   - cadmio_lz_compress()  : LZSS-style compression (pure-Luau decodeable)
+#   - zstd_raw_wrap()       : wrap in a real zstd frame (raw blocks only)
+#   - build_bootstrap()     : full pipeline -> self-contained Lua bootstrap
+#                            with inline base64 + zstd raw + Cadmio-LZ decoders
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
+import cadmio_postproc
+
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
-LUNE_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "catlog.luau")
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-STUFF_DIR = os.path.join(SCRIPT_DIR, "stuff")
+LUNE_SCRIPT = os.path.join(_SCRIPT_DIR, "catlog.luau")
+STUFF_DIR = os.path.join(_SCRIPT_DIR, "stuff")
 API_DUMP = os.path.join(STUFF_DIR, "API-Dump.json")
 CLASSES_JSON = os.path.join(STUFF_DIR, "classes.json")
 ENUMS_JSON = os.path.join(STUFF_DIR, "enums.json")
@@ -24,7 +36,16 @@ ASSETIDS_JSON = os.path.join(STUFF_DIR, "assetids.json")
 LUNE_BIN = os.getenv("LUNE_BIN", "lune")
 TIMEOUT_SECONDS = 30
 
+# Always-on post-processing pipeline:
+#   catlog output -> minify -> Cadmio-LZ compress -> zstd raw-frame wrap
+#                  -> base64 -> embed in self-contained Lua bootstrap.
+# The bootstrap decodes everything at runtime using only bit32 / string /
+# table ops — no executor zstd API needed, no RC4, no external files.
+# It is fully Roblox/Delta compatible.
+POSTPROC_ALWAYS_ON = True  # set to False to disable (debugging only)
+
 NO_MENTIONS = discord.AllowedMentions.none()
+
 
 def sanitize_output(text: str) -> str:
     ZWSP = '\u200b'
@@ -35,12 +56,14 @@ def sanitize_output(text: str) -> str:
     text = re.sub(r'<#(\d+)>', lambda m: '<#' + ZWSP + m.group(1) + '>', text)
     return text
 
+
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix=".", intents=intents, help_command=None, allowed_mentions=discord.AllowedMentions.none())
 
 URL_PATTERN = re.compile(r'https?://\S+')
+
 
 async def download_from_url(url: str) -> str | None:
     if "github.com" in url and "/blob/" in url:
@@ -57,6 +80,7 @@ async def download_from_url(url: str) -> str | None:
     except Exception:
         return None
     return None
+
 
 async def extract_code(ctx: commands.Context, content: str) -> str | None:
     if ctx.message.attachments:
@@ -96,6 +120,7 @@ async def extract_code(ctx: commands.Context, content: str) -> str | None:
 
 
 def run_lune(code: str) -> tuple[bool, str]:
+    """Run catlog.luau on `code` via lune, returning (success, output_or_error)."""
     with tempfile.TemporaryDirectory() as tmp:
         input_path = os.path.join(tmp, "input.lua")
         output_path = os.path.join(tmp, "out.lua")
@@ -148,8 +173,37 @@ def run_lune(code: str) -> tuple[bool, str]:
         return False, (proc.stdout or "No output.").strip()[:1900]
 
 
+def postprocess(obfuscated_lua: str) -> tuple[bool, str]:
+    """
+    Apply the always-on Cadmio post-processing pipeline:
+        minify -> Cadmio-LZ compress -> zstd raw-frame wrap -> base64
+        -> embed in self-contained Lua bootstrap with inline decoders.
+
+    Returns (success, final_lua_or_error_message).
+    """
+    try:
+        bootstrap = cadmio_postproc.build_bootstrap(obfuscated_lua)
+        return True, bootstrap
+    except Exception as exc:
+        # If post-processing fails, fall back to the raw obfuscated output so
+        # the user still gets something usable. We surface the error in a
+        # trailing comment so it's visible but doesn't break execution.
+        err_msg = f"-- [Cadmio postproc fallback] zstd/minify pipeline failed: {exc!r}\n"
+        return False, err_msg + obfuscated_lua
+
+
 @bot.command(name="l")
 async def analyze(ctx: commands.Context, *, text: str = ""):
+    """
+    Obfuscate the given Lua/Luau source.
+
+    Accepts: file attachment, replied message, ```lua``` code block, or URL.
+    Pipeline (always on):
+        catlog obfuscate  ->  minify  ->  Cadmio-LZ compress
+                          ->  zstd raw-frame wrap  ->  base64
+                          ->  self-contained Lua bootstrap (run-ready in
+                              Roblox/Delta, no executor zstd API required)
+    """
     code = await extract_code(ctx, text)
 
     if not code or not code.strip():
@@ -164,11 +218,21 @@ async def analyze(ctx: commands.Context, *, text: str = ""):
         loop = asyncio.get_running_loop()
         ok, result = await loop.run_in_executor(None, run_lune, code)
 
-    result = sanitize_output(result)
+        if not ok:
+            result = sanitize_output(result)
+            await ctx.reply(f"Error:\n```\n{result}\n```", allowed_mentions=NO_MENTIONS)
+            return
 
-    if not ok:
-        await ctx.reply(f"Error:\n```\n{result}\n```", allowed_mentions=NO_MENTIONS)
-        return
+        # Always-on minify + zstd-wrap integration
+        if POSTPROC_ALWAYS_ON:
+            ok_pp, final_result = await loop.run_in_executor(None, postprocess, result)
+            if not ok_pp:
+                # Postproc fell back to raw obfuscated output (with a comment
+                # explaining the failure). Still deliver something usable.
+                pass
+            result = final_result
+
+    result = sanitize_output(result)
 
     if len(result) > 1900:
         file = discord.File(io.BytesIO(result.encode("utf-8")), filename="result.lua")
@@ -180,6 +244,8 @@ async def analyze(ctx: commands.Context, *, text: str = ""):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    if POSTPROC_ALWAYS_ON:
+        print("[Cadmio] post-processing pipeline (minify + Cadmio-LZ + zstd raw-frame + base64 bootstrap) is ALWAYS ON for .l")
 
 
 if __name__ == "__main__":
