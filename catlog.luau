@@ -359,6 +359,7 @@ except Exception as e:
 end
 
 local API_DUMP_PATH = "stuff/API-Dump.json"
+local API_DUMP_TXT_PATH = "stuff/API-Dump.txt"
 local apiClassesByName = {}
 
 local function getScriptDir(): string?
@@ -502,6 +503,126 @@ local apiLoadOk, apiLoadErr = pcall(loadApiDump)
 if not apiLoadOk then
     local location = RESOLVED_API_DUMP_PATH or API_DUMP_PATH
     error("Failed to load API dump from " .. location .. ": " .. tostring(apiLoadErr))
+end
+
+local function resolveApiDumpTxtPath(): string?
+    if type(Settings.api_dump_txt) == "string" and Settings.api_dump_txt ~= "" then
+        local ok = pcall(fs.readFile, Settings.api_dump_txt)
+        if ok then return Settings.api_dump_txt end
+    end
+    if type(process.env.CADMIO_API_DUMP_TXT) == "string" and process.env.CADMIO_API_DUMP_TXT ~= "" then
+        local ok = pcall(fs.readFile, process.env.CADMIO_API_DUMP_TXT)
+        if ok then return process.env.CADMIO_API_DUMP_TXT end
+    end
+    do
+        local ok = pcall(fs.readFile, API_DUMP_TXT_PATH)
+        if ok then return API_DUMP_TXT_PATH end
+    end
+    if SCRIPT_DIR then
+        local candidate = SCRIPT_DIR .. API_DUMP_TXT_PATH
+        local ok = pcall(fs.readFile, candidate)
+        if ok then return candidate end
+    end
+    local cwd = process.cwd or ""
+    for _ = 1, 6 do
+        if cwd == "" then break end
+        local candidate = cwd .. "/" .. API_DUMP_TXT_PATH
+        local ok = pcall(fs.readFile, candidate)
+        if ok then return candidate end
+        local parent = cwd:match("(.*)/[^/]*")
+        if not parent or parent == cwd then break end
+        cwd = parent
+    end
+    return nil
+end
+
+local function parseTxtTags(rest: string): {string}
+    local tags = {}
+    for tag in rest:gmatch("%[([^%]]+)%]") do
+        table.insert(tags, tag)
+    end
+    return tags
+end
+
+local function loadApiDumpTxt(path: string)
+    local raw = fs.readFile(path)
+    raw = raw:gsub("\r\n", "\n"):gsub("\r", "\n")
+    local currentClass = nil
+
+    for line in raw:gmatch("[^\n]*") do
+        if line == "" then
+            -- skip
+        elseif line:match("^\t") then
+            local trimmed = line:gsub("^\t", "")
+            if currentClass then
+                local memberName, memberType
+                local _, propName = trimmed:match("^Property%s+([%w_]+)%.([%w_]+)%s*:")
+                if propName then
+                    memberName, memberType = propName, "Property"
+                else
+                    local _, fnName = trimmed:match("^Function%s+([%w_]+):([%w_]+)")
+                    if fnName then
+                        memberName, memberType = fnName, "Function"
+                    else
+                        local _, evName = trimmed:match("^Event%s+([%w_]+)%.([%w_]+)")
+                        if evName then
+                            memberName, memberType = evName, "Event"
+                        else
+                            local _, cbName = trimmed:match("^Callback%s+([%w_]+)%.([%w_]+)")
+                            if cbName then
+                                memberName, memberType = cbName, "Callback"
+                            end
+                        end
+                    end
+                end
+
+                if memberName and not currentClass.members[memberName] then
+                    currentClass.members[memberName] = {
+                        memberType = memberType,
+                        name = memberName,
+                        tags = makeTagSet(parseTxtTags(trimmed)),
+                    }
+                end
+            end
+        else
+            local className, superclass, rest = line:match("^Class%s+(%S+)%s*:%s*(%S+)(.*)$")
+            if className then
+                local sc = (superclass ~= "<<<ROOT>>>" and superclass ~= "") and superclass or nil
+                if not apiClassesByName[className] then
+                    apiClassesByName[className] = {
+                        name = className,
+                        superclass = sc,
+                        tags = makeTagSet(parseTxtTags(rest or "")),
+                        members = {},
+                    }
+                end
+                currentClass = apiClassesByName[className]
+            else
+                local classNameNoSC, rest2 = line:match("^Class%s+(%S+)(.*)$")
+                if classNameNoSC then
+                    if not apiClassesByName[classNameNoSC] then
+                        apiClassesByName[classNameNoSC] = {
+                            name = classNameNoSC,
+                            superclass = nil,
+                            tags = makeTagSet(parseTxtTags(rest2 or "")),
+                            members = {},
+                        }
+                    end
+                    currentClass = apiClassesByName[classNameNoSC]
+                else
+                    currentClass = nil
+                end
+            end
+        end
+    end
+end
+
+local RESOLVED_API_DUMP_TXT_PATH = resolveApiDumpTxtPath()
+if RESOLVED_API_DUMP_TXT_PATH then
+    local okTxt, errTxt = pcall(loadApiDumpTxt, RESOLVED_API_DUMP_TXT_PATH)
+    if not okTxt then
+        stdio.ewrite("[catlog] API-Dump.txt load failed: " .. tostring(errTxt) .. "\n")
+    end
 end
 
 local enumsData = {}
@@ -3717,12 +3838,34 @@ makeProxy = function(name: string): any
                 error("GetService: DebuggerManager not available", 0)
             end
             if SERVER_ONLY_SERVICES[serviceName] then
+                if not serviceCache[serviceName] then
+                    local svc = spyInstance(serviceName, serviceName:lower(), true)
+                    local svcMt = getmetatable(svc)
+                    svcMt._className = serviceName
+                    svcMt._storedValues["ClassName"] = serviceName
+                    svcMt._setKeys["ClassName"] = true
+                    svcMt._storedValues["Name"] = serviceName
+                    svcMt._setKeys["Name"] = true
+                    svcMt._declaredExpr = string.format('game:GetService("%s")', serviceName)
+                    serviceCache[serviceName] = svc
+                end
                 emit(string.format('local %s = %s:GetService(%s)', serviceName, parentName, serialize(firstArg)))
-                error("GetService: " .. serviceName .. " is not a valid service", 0)
+                return serviceCache[serviceName]
             end
             if not isApiServiceClass(serviceName) then
+                if not serviceCache[serviceName] then
+                    local svc = spyInstance(serviceName, serviceName:lower(), true)
+                    local svcMt = getmetatable(svc)
+                    svcMt._className = serviceName
+                    svcMt._storedValues["ClassName"] = serviceName
+                    svcMt._setKeys["ClassName"] = true
+                    svcMt._storedValues["Name"] = serviceName
+                    svcMt._setKeys["Name"] = true
+                    svcMt._declaredExpr = string.format('game:GetService("%s")', serviceName)
+                    serviceCache[serviceName] = svc
+                end
                 emit(string.format('local %s = %s:GetService(%s)', serviceName, parentName, serialize(firstArg)))
-                error("GetService: " .. serviceName .. " is not a valid service", 0)
+                return serviceCache[serviceName]
             end
             if serviceCache[serviceName] then
                 emit(string.format('local %s = %s:GetService(%s)', serviceName, parentName, serialize(firstArg)))
