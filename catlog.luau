@@ -9361,20 +9361,26 @@ local function dump(source: string): string
         end) end)
     end
 
-    local ok, err = pcall(fn)
+    local _caughtErr, _caughtTb
+    local function _errHandler(e)
+        _caughtErr = tostring(e)
+        local okTb, tb = pcall(function() return debug.traceback("", 2) end)
+        if okTb and tb and #tb > 0 then
+            _caughtTb = tb:sub(1, 1500)
+        end
+        return e
+    end
+    local ok, err = xpcall(fn, _errHandler)
     task.cancel(watchdog)
     if not ok then
-        local errStr = tostring(err)
+        local errStr = _caughtErr or tostring(err)
         if errStr:find("WALL_CLOCK_TIMEOUT", 1, true) then
             emit(string.format("-- Timeout after %.1fs", realOsClock() - wallStart))
         elseif not errStr:find(BUDGET_ERROR, 1, true) then
             emit(string.format("-- Runtime error: %s", errStr:sub(1, 500)))
-            -- Diagnostic: include traceback (limited size)
-            local tb = debug.traceback("", 2)
-            if tb and #tb > 0 then
-                emit(string.format("-- Traceback (truncated):\n%s", tb:sub(1, 600)))
+            if _caughtTb then
+                emit(string.format("-- Traceback (captured at error site):\n%s", _caughtTb))
             end
-            -- Print missing globals if any were probed
             if env._missingGlobalsLog and #env._missingGlobalsLog > 0 then
                 emit(string.format("-- Missing globals probed (%d): %s",
                     #env._missingGlobalsLog, table.concat(env._missingGlobalsLog, ", ")))
