@@ -10,10 +10,13 @@ local net = require("@lune/net")
 
 local Settings = {
     out = "out.lua",
-    timeout = 60,
+    timeout = 45,
     ipt = nil :: string?,
     beautify = true,
     inline = true,
+    heavy_beautify_limit = 450000,
+    inline_line_limit = 50000,
+    dce_line_limit = 90000,
 }
 for _, arg in process.args do
     local k, v = string.match(arg, "([%w_]+)=(.+)")
@@ -484,12 +487,9 @@ local function loadApiDump()
                         memberType = tostring(member.MemberType or ""),
                         name = member.Name,
                         security = member.Security,
-                        serialization = member.Serialization,
-                        threadSafety = member.ThreadSafety,
                         tags = makeTagSet(member.Tags),
                         valueType = normalizeApiType(member.ValueType),
                         returnType = normalizeApiType(member.ReturnType),
-                        parameters = member.Parameters,
                     }
                 end
             end
@@ -617,7 +617,7 @@ local function loadApiDumpTxt(path: string)
     end
 end
 
-local RESOLVED_API_DUMP_TXT_PATH = resolveApiDumpTxtPath()
+local RESOLVED_API_DUMP_TXT_PATH = Settings.merge_api_txt == true and resolveApiDumpTxtPath() or nil
 if RESOLVED_API_DUMP_TXT_PATH then
     local okTxt, errTxt = pcall(loadApiDumpTxt, RESOLVED_API_DUMP_TXT_PATH)
     if not okTxt then
@@ -705,7 +705,7 @@ local function loadClasses()
         end
     end
 end
-pcall(loadClasses)
+if Settings.load_classes == true then pcall(loadClasses) end
 
 local assetIdsData = {}
 local function loadAssetIds()
@@ -746,7 +746,7 @@ local function loadAssetIds()
         end
     end
 end
-pcall(loadAssetIds)
+if Settings.load_assetids == true then pcall(loadAssetIds) end
 
 local function getApiClassInfo(className)
     if type(className) ~= "string" then
@@ -755,44 +755,68 @@ local function getApiClassInfo(className)
     return apiClassesByName[className]
 end
 
-local function resolveApiMember(className, memberName)
-    if type(className) ~= "string" or type(memberName) ~= "string" then
-        return nil, nil
-    end
+local apiMemberCache = {}
+local classChainCache = {}
+local classIsACache = {}
 
+local function getClassChain(className)
+    local cached = classChainCache[className]
+    if cached then return cached end
+    local chain = {}
     local classInfo = getApiClassInfo(className)
     while classInfo do
-        local memberInfo = classInfo.members[memberName]
-        if memberInfo then
-            return memberInfo, classInfo
-        end
-
-        if type(classInfo.superclass) ~= "string" or classInfo.superclass == "" then
-            break
-        end
+        chain[#chain + 1] = classInfo
+        if type(classInfo.superclass) ~= "string" or classInfo.superclass == "" then break end
         classInfo = getApiClassInfo(classInfo.superclass)
     end
+    classChainCache[className] = chain
+    return chain
+end
 
+local function resolveApiMember(className, memberName)
+    if type(className) ~= "string" or type(memberName) ~= "string" then return nil, nil end
+    local byClass = apiMemberCache[className]
+    if not byClass then
+        byClass = {}
+        apiMemberCache[className] = byClass
+    end
+    local cached = byClass[memberName]
+    if cached ~= nil then
+        if cached == false then return nil, nil end
+        return cached[1], cached[2]
+    end
+    local chain = getClassChain(className)
+    for i = 1, #chain do
+        local classInfo = chain[i]
+        local memberInfo = classInfo.members and classInfo.members[memberName] or nil
+        if memberInfo then
+            byClass[memberName] = {memberInfo, classInfo}
+            return memberInfo, classInfo
+        end
+    end
+    byClass[memberName] = false
     return nil, nil
 end
 
 local function classIsA(className, targetClassName)
-    if type(className) ~= "string" or type(targetClassName) ~= "string" then
-        return false
+    if type(className) ~= "string" or type(targetClassName) ~= "string" then return false end
+    local byClass = classIsACache[className]
+    if not byClass then
+        byClass = {}
+        classIsACache[className] = byClass
     end
-    if className == targetClassName then
-        return true
-    end
-
-    local classInfo = getApiClassInfo(className)
-    while classInfo and type(classInfo.superclass) == "string" and classInfo.superclass ~= "" do
-        if classInfo.superclass == targetClassName then
-            return true
+    local cached = byClass[targetClassName]
+    if cached ~= nil then return cached end
+    local result = false
+    local chain = getClassChain(className)
+    for i = 1, #chain do
+        if chain[i].name == targetClassName then
+            result = true
+            break
         end
-        classInfo = getApiClassInfo(classInfo.superclass)
     end
-
-    return false
+    byClass[targetClassName] = result
+    return result
 end
 
 local function isApiServiceClass(className)
@@ -912,10 +936,14 @@ local OP_BUDGET = 5000000
 local BUDGET_ERROR = "__OP_BUDGET_EXCEEDED__"
 
 local PARTIAL_DUMP_PATH = "/tmp/catlog_partial_dump.lua"
+local PARTIAL_FLUSH_INTERVAL = math.max(5000, math.floor(tonumber(Settings.flush_interval) or 50000))
 local lastFlushCount = 0
+local nextFlushCount = PARTIAL_FLUSH_INTERVAL
+local lastEmitted = nil
 local function flushPartial()
-    if #lines == lastFlushCount then return end
-    lastFlushCount = #lines
+    local count = #lines
+    if count == lastFlushCount then return end
+    lastFlushCount = count
     pcall(function()
         local env_line = ""
         if Settings.ipt then
@@ -926,8 +954,12 @@ local function flushPartial()
 end
 
 local function emit(text: string)
-    table.insert(lines, text)
-    if #lines % 50 == 0 then
+    if Settings.beautify and text == lastEmitted then return end
+    lastEmitted = text
+    local count = #lines + 1
+    lines[count] = text
+    if count >= nextFlushCount then
+        nextFlushCount = count + math.max(PARTIAL_FLUSH_INTERVAL, math.floor(count * 0.5))
         flushPartial()
     end
 end
@@ -943,8 +975,16 @@ local function tick()
     end
 end
 
+local proxyIdentityCache = setmetatable({}, { __mode = "k" })
 local function isProxy(v: any): boolean
-    return type(v) == "table" and getmetatable(v) ~= nil and getmetatable(v)._isProxy == true
+    if type(v) ~= "table" then return false end
+    if proxyIdentityCache[v] then return true end
+    local mt = getmetatable(v)
+    if mt and mt._isProxy == true then
+        proxyIdentityCache[v] = true
+        return true
+    end
+    return false
 end
 
 -- Forward declarations (functions used before full definition)
@@ -952,30 +992,109 @@ local ensureDeclared: (any) -> ()  -- declared properly below, used by proxyName
 local serialize: (any, number?) -> string
 
 local dataMTs = {}
+local DATA_PROXY_METHODS = {
+    Lerp = true, Dot = true, Cross = true, Angle = true, FuzzyEq = true, Abs = true,
+    ToHSV = true, ToHex = true, ToRGB = true, ToOrientation = true, ToEulerAnglesXYZ = true,
+    ToEulerAnglesYXZ = true, Inverse = true, ToWorldSpace = true, ToObjectSpace = true,
+    PointToObjectSpace = true, PointToWorldSpace = true, VectorToObjectSpace = true, VectorToWorldSpace = true,
+    Components = true, GetComponents = true,
+}
+local function vecArgs(v)
+    if type(v) ~= "table" then return nil end
+    local a = rawget(v, "_ctorArgs")
+    if a ~= nil then return a end
+    local m = getmetatable(v)
+    return m and m._ctorArgs or nil
+end
+
+local function ctorOf(v)
+    if type(v) ~= "table" then return nil end
+    local c = rawget(v, "_ctorName")
+    if c ~= nil then return c end
+    local m = getmetatable(v)
+    return m and m._ctorName or nil
+end
+
+local function cfValues(v)
+    local a = vecArgs(v) or {}
+    return a[1] or 0, a[2] or 0, a[3] or 0,
+        a[4] or 1, a[5] or 0, a[6] or 0,
+        a[7] or 0, a[8] or 1, a[9] or 0,
+        a[10] or 0, a[11] or 0, a[12] or 1
+end
+
+local function cfPoint(v, p)
+    local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cfValues(v)
+    local pa = vecArgs(p) or {}
+    local px, py, pz = pa[1] or 0, pa[2] or 0, pa[3] or 0
+    return x + r00 * px + r01 * py + r02 * pz,
+        y + r10 * px + r11 * py + r12 * pz,
+        z + r20 * px + r21 * py + r22 * pz
+end
+
+local function cfVector(v, p)
+    local _, _, _, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cfValues(v)
+    local pa = vecArgs(p) or {}
+    local px, py, pz = pa[1] or 0, pa[2] or 0, pa[3] or 0
+    return r00 * px + r01 * py + r02 * pz,
+        r10 * px + r11 * py + r12 * pz,
+        r20 * px + r21 * py + r22 * pz
+end
+
+local function cfObjectPoint(v, p)
+    local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cfValues(v)
+    local pa = vecArgs(p) or {}
+    local px, py, pz = (pa[1] or 0) - x, (pa[2] or 0) - y, (pa[3] or 0) - z
+    return r00 * px + r10 * py + r20 * pz,
+        r01 * px + r11 * py + r21 * pz,
+        r02 * px + r12 * py + r22 * pz
+end
+
+local function cfObjectVector(v, p)
+    local _, _, _, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cfValues(v)
+    local pa = vecArgs(p) or {}
+    local px, py, pz = pa[1] or 0, pa[2] or 0, pa[3] or 0
+    return r00 * px + r10 * py + r20 * pz,
+        r01 * px + r11 * py + r21 * pz,
+        r02 * px + r12 * py + r22 * pz
+end
+
+local function cfMulArgs(a, b)
+    local ax, ay, az, a00, a01, a02, a10, a11, a12, a20, a21, a22 = cfValues(a)
+    local bx, by, bz, b00, b01, b02, b10, b11, b12, b20, b21, b22 = cfValues(b)
+    return {
+        ax + a00 * bx + a01 * by + a02 * bz,
+        ay + a10 * bx + a11 * by + a12 * bz,
+        az + a20 * bx + a21 * by + a22 * bz,
+        a00 * b00 + a01 * b10 + a02 * b20,
+        a00 * b01 + a01 * b11 + a02 * b21,
+        a00 * b02 + a01 * b12 + a02 * b22,
+        a10 * b00 + a11 * b10 + a12 * b20,
+        a10 * b01 + a11 * b11 + a12 * b21,
+        a10 * b02 + a11 * b12 + a12 * b22,
+        a20 * b00 + a21 * b10 + a22 * b20,
+        a20 * b01 + a21 * b11 + a22 * b21,
+        a20 * b02 + a21 * b12 + a22 * b22,
+    }
+end
+
 local function makeDataProxy(ctorName, ctorArgs, name)
     if not dataMTs[ctorName] then
         local dmt = {
             _isProxy = true,
             __eq = function(a, b)
                 if rawequal(a, b) then return true end
-                local aa = rawget(a, "_ctorArgs")
-                local ba = rawget(b, "_ctorArgs")
-                local ac = rawget(a, "_ctorName")
-                local bc = rawget(b, "_ctorName")
-                if ac and bc and ac == bc and aa and ba then
-                    if #aa == #ba then
-                        local allEq = true
-                        for i, v in ipairs(aa) do
-                            if v ~= ba[i] then allEq = false break end
-                        end
-                        if allEq then return true end
-                    end
+                if ctorOf(a) ~= ctorOf(b) then return false end
+                local aa, ba = vecArgs(a), vecArgs(b)
+                if not aa or not ba or #aa ~= #ba then return false end
+                for i = 1, #aa do
+                    if aa[i] ~= ba[i] then return false end
                 end
-                return false
+                return true
             end,
             __tostring = function(a)
-                local cn = rawget(a, "_ctorName") or ctorName
-                local args = rawget(a, "_ctorArgs") or {}
+                local cn = ctorOf(a) or ctorName
+                local args = vecArgs(a) or {}
                 if cn == "Vector3" then
                     return tostring(args[1] or 0) .. ", " .. tostring(args[2] or 0) .. ", " .. tostring(args[3] or 0)
                 elseif cn == "Vector2" then
@@ -984,35 +1103,71 @@ local function makeDataProxy(ctorName, ctorArgs, name)
                     return tostring(args[1] or 0) .. ", " .. tostring(args[2] or 0) .. ", " .. tostring(args[3] or 0)
                 elseif cn == "UDim2" then
                     return "{" .. tostring(args[1] or 0) .. ", " .. tostring(args[2] or 0) .. "}, {" .. tostring(args[3] or 0) .. ", " .. tostring(args[4] or 0) .. "}"
+                elseif cn == "CFrame" then
+                    return tostring(args[1] or 0) .. ", " .. tostring(args[2] or 0) .. ", " .. tostring(args[3] or 0)
                 end
                 return rawget(a, "_name") or ctorName
             end,
             __index = function(a, k)
-                local args = rawget(a, "_ctorArgs") or {}
-                local cn = rawget(a, "_ctorName") or ctorName
+                local args = vecArgs(a) or {}
+                local cn = ctorOf(a) or ctorName
                 if cn == "CFrame" then
-                    if k == "Position" then
-                        return makeDataProxy("Vector3", { args[1] or 0, args[2] or 0, args[3] or 0 }, (rawget(a,"_name") or "cf")..".Position")
+                    local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cfValues(a)
+                    if k == "Position" or k == "p" then
+                        local cached = rawget(a, "_cachePosition")
+                        if cached then return cached end
+                        cached = makeDataProxy("Vector3", {x, y, z}, (rawget(a, "_name") or "cf") .. ".Position")
+                        rawset(a, "_cachePosition", cached)
+                        return cached
                     end
-                    if k == "X" then return args[1] or 0 end
-                    if k == "Y" then return args[2] or 0 end
-                    if k == "Z" then return args[3] or 0 end
-                    if k == "LookVector" then return makeDataProxy("Vector3", {0, 0, -1}, "LookVector") end
-                    if k == "RightVector" then return makeDataProxy("Vector3", {1, 0, 0}, "RightVector") end
-                    if k == "UpVector" then return makeDataProxy("Vector3", {0, 1, 0}, "UpVector") end
+                    if k == "X" then return x end
+                    if k == "Y" then return y end
+                    if k == "Z" then return z end
+                    if k == "RightVector" or k == "XVector" then
+                        local cached = rawget(a, "_cacheRightVector")
+                        if cached then return cached end
+                        cached = makeDataProxy("Vector3", {r00, r10, r20}, (rawget(a, "_name") or "cf") .. ".RightVector")
+                        rawset(a, "_cacheRightVector", cached)
+                        return cached
+                    end
+                    if k == "UpVector" or k == "YVector" then
+                        local cached = rawget(a, "_cacheUpVector")
+                        if cached then return cached end
+                        cached = makeDataProxy("Vector3", {r01, r11, r21}, (rawget(a, "_name") or "cf") .. ".UpVector")
+                        rawset(a, "_cacheUpVector", cached)
+                        return cached
+                    end
+                    if k == "LookVector" then
+                        local cached = rawget(a, "_cacheLookVector")
+                        if cached then return cached end
+                        cached = makeDataProxy("Vector3", {-r02, -r12, -r22}, (rawget(a, "_name") or "cf") .. ".LookVector")
+                        rawset(a, "_cacheLookVector", cached)
+                        return cached
+                    end
+                    if k == "ZVector" then
+                        local cached = rawget(a, "_cacheZVector")
+                        if cached then return cached end
+                        cached = makeDataProxy("Vector3", {r02, r12, r22}, (rawget(a, "_name") or "cf") .. ".ZVector")
+                        rawset(a, "_cacheZVector", cached)
+                        return cached
+                    end
                 end
                 if k == "X" or k == "x" then return args[1] or 0 end
                 if k == "Y" or k == "y" then return args[2] or 0 end
                 if k == "Z" or k == "z" then return args[3] or 0 end
                 if k == "Magnitude" then
                     local x, y, z = args[1] or 0, args[2] or 0, args[3] or 0
-                    return math.sqrt(x*x + y*y + z*z)
+                    return math.sqrt(x * x + y * y + z * z)
                 end
                 if k == "Unit" then
+                    local cached = rawget(a, "_cacheUnit")
+                    if cached then return cached end
                     local x, y, z = args[1] or 0, args[2] or 0, args[3] or 0
-                    local mag = math.sqrt(x*x + y*y + z*z)
-                    if mag == 0 then mag = 1 end
-                    return makeDataProxy(ctorName, {x/mag, y/mag, z/mag}, (rawget(a,"_name") or "v")..".Unit")
+                    local mag = math.sqrt(x * x + y * y + z * z)
+                    if mag == 0 then cached = makeDataProxy(cn, {0, 0, 0}, (rawget(a, "_name") or "v") .. ".Unit")
+                    else cached = makeDataProxy(cn, {x / mag, y / mag, z / mag}, (rawget(a, "_name") or "v") .. ".Unit") end
+                    rawset(a, "_cacheUnit", cached)
+                    return cached
                 end
                 if k == "R" then return args[1] or 0 end
                 if k == "G" then return args[2] or 0 end
@@ -1021,51 +1176,119 @@ local function makeDataProxy(ctorName, ctorArgs, name)
                 if k == "Offset" then return args[2] or 0 end
                 if k == "Width" then return args[1] or 0 end
                 if k == "Height" then return args[2] or 0 end
-                local DATA_METHODS = { Lerp = true, Dot = true, Cross = true, Angle = true, FuzzyEq = true, Abs = true, ToHSV = true, ToHex = true, ToRGB = true, ToOrientation = true, Inverse = true, ToWorldSpace = true, ToObjectSpace = true, PointToObjectSpace = true }
-                if DATA_METHODS[k] then
-                    return function(self, ...)
-                        local retName = genVar("v")
-                        local parentName = rawget(a, "_name") or ctorName
-                        local args = {...}
+                if DATA_PROXY_METHODS[k] then
+                    return function(_, ...)
+                        local callArgs = {...}
+                        local parentName = rawget(a, "_name") or cn
                         local parts = {}
-                        for i = 1, select("#", ...) do
-                            local arg = args[i]
-                            if type(arg) == "table" and rawget(arg, "_name") then
-                                table.insert(parts, rawget(arg, "_name"))
-                            elseif type(arg) == "string" then
-                                table.insert(parts, '"' .. arg .. '"')
-                            else
-                                table.insert(parts, tostring(arg))
-                            end
-                        end
+                        for i = 1, select("#", ...) do table.insert(parts, serialize(callArgs[i])) end
+                        local retName = genVar("v")
                         emit(string.format('local %s = %s:%s(%s)', retName, parentName, k, table.concat(parts, ", ")))
-                        if k == "Lerp" then
-                            local proxy = makeProxy(retName)
-                            local pmt = getmetatable(proxy)
-                            pmt._ctorName = ctorName
-                            return proxy
-                        elseif k == "Cross" then
-                            local proxy = makeProxy(retName)
-                            local pmt = getmetatable(proxy)
-                            pmt._ctorName = "Vector3"
-                            return proxy
-                        elseif k == "Dot" or k == "Angle" then
-                            return 0
-                        elseif k == "ToHSV" then
-                            return 0, 0, 0, 0
-                        elseif k == "ToHex" then
-                            return "ffffff"
-                        elseif k == "ToRGB" then
-                            return 255, 255, 255
-                        elseif k == "ToOrientation" then
-                            return 0, 0, 0
-                        elseif k == "FuzzyEq" then
-                            return true
-                        elseif k == "Inverse" or k == "ToWorldSpace" or k == "ToObjectSpace" or k == "PointToObjectSpace" or k == "Abs" then
-                            local proxy = makeProxy(retName)
-                            local pmt = getmetatable(proxy)
-                            pmt._ctorName = ctorName
-                            return proxy
+                        if cn == "Vector3" then
+                            local x, y, z = args[1] or 0, args[2] or 0, args[3] or 0
+                            local b = callArgs[1]
+                            local ba = vecArgs(b) or {}
+                            local bx, by, bz = ba[1] or 0, ba[2] or 0, ba[3] or 0
+                            if k == "Dot" then return x * bx + y * by + z * bz end
+                            if k == "Cross" then return makeDataProxy("Vector3", {y * bz - z * by, z * bx - x * bz, x * by - y * bx}, retName) end
+                            if k == "Angle" then
+                                local ma = math.sqrt(x * x + y * y + z * z)
+                                local mb = math.sqrt(bx * bx + by * by + bz * bz)
+                                if ma == 0 or mb == 0 then return 0 end
+                                local d = (x * bx + y * by + z * bz) / (ma * mb)
+                                if d > 1 then d = 1 elseif d < -1 then d = -1 end
+                                return math.acos(d)
+                            end
+                            if k == "FuzzyEq" then
+                                local eps = tonumber(callArgs[2]) or 1e-5
+                                return math.abs(x - bx) <= eps * math.max(1, math.abs(x), math.abs(bx)) and math.abs(y - by) <= eps * math.max(1, math.abs(y), math.abs(by)) and math.abs(z - bz) <= eps * math.max(1, math.abs(z), math.abs(bz))
+                            end
+                            if k == "Abs" then return makeDataProxy("Vector3", {math.abs(x), math.abs(y), math.abs(z)}, retName) end
+                            if k == "Lerp" then
+                                local alpha = tonumber(callArgs[2]) or 0
+                                return makeDataProxy("Vector3", {x + (bx - x) * alpha, y + (by - y) * alpha, z + (bz - z) * alpha}, retName)
+                            end
+                        elseif cn == "Vector2" then
+                            local x, y = args[1] or 0, args[2] or 0
+                            local ba = vecArgs(callArgs[1]) or {}
+                            local bx, by = ba[1] or 0, ba[2] or 0
+                            if k == "Dot" then return x * bx + y * by end
+                            if k == "Cross" then return x * by - y * bx end
+                            if k == "Abs" then return makeDataProxy("Vector2", {math.abs(x), math.abs(y)}, retName) end
+                            if k == "Lerp" then
+                                local alpha = tonumber(callArgs[2]) or 0
+                                return makeDataProxy("Vector2", {x + (bx - x) * alpha, y + (by - y) * alpha}, retName)
+                            end
+                        elseif cn == "CFrame" then
+                            if k == "PointToObjectSpace" then
+                                local x, y, z = cfObjectPoint(a, callArgs[1])
+                                return makeDataProxy("Vector3", {x, y, z}, retName)
+                            end
+                            if k == "PointToWorldSpace" then
+                                local x, y, z = cfPoint(a, callArgs[1])
+                                return makeDataProxy("Vector3", {x, y, z}, retName)
+                            end
+                            if k == "VectorToObjectSpace" then
+                                local x, y, z = cfObjectVector(a, callArgs[1])
+                                return makeDataProxy("Vector3", {x, y, z}, retName)
+                            end
+                            if k == "VectorToWorldSpace" then
+                                local x, y, z = cfVector(a, callArgs[1])
+                                return makeDataProxy("Vector3", {x, y, z}, retName)
+                            end
+                            if k == "ToWorldSpace" then return makeDataProxy("CFrame", cfMulArgs(a, callArgs[1]), retName) end
+                            if k == "ToObjectSpace" then
+                                local inv = a:Inverse()
+                                return makeDataProxy("CFrame", cfMulArgs(inv, callArgs[1]), retName)
+                            end
+                            if k == "Inverse" then
+                                local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cfValues(a)
+                                local ix = -(r00 * x + r10 * y + r20 * z)
+                                local iy = -(r01 * x + r11 * y + r21 * z)
+                                local iz = -(r02 * x + r12 * y + r22 * z)
+                                return makeDataProxy("CFrame", {ix, iy, iz, r00, r10, r20, r01, r11, r21, r02, r12, r22}, retName)
+                            end
+                            if k == "Lerp" then
+                                local b = callArgs[1]
+                                local alpha = tonumber(callArgs[2]) or 0
+                                local aa, ba = vecArgs(a) or {}, vecArgs(b) or {}
+                                local out = {}
+                                for i = 1, 12 do
+                                    local av = aa[i]
+                                    local bv = ba[i]
+                                    local identity = (i == 4 or i == 8 or i == 12) and 1 or 0
+                                    if av == nil then av = identity end
+                                    if bv == nil then bv = identity end
+                                    out[i] = av + (bv - av) * alpha
+                                end
+                                return makeDataProxy("CFrame", out, retName)
+                            end
+                            if k == "Components" or k == "GetComponents" then return cfValues(a) end
+                            if k == "ToOrientation" or k == "ToEulerAnglesXYZ" or k == "ToEulerAnglesYXZ" then
+                                local _, _, _, r00, _, _, r10, r11, r12, r20, r21, r22 = cfValues(a)
+                                local sy = -r20
+                                if sy > 1 then sy = 1 elseif sy < -1 then sy = -1 end
+                                local ry = math.asin(sy)
+                                local cy = math.cos(ry)
+                                local rx, rz
+                                if math.abs(cy) > 1e-7 then
+                                    rx = math.atan2(r21, r22)
+                                    rz = math.atan2(r10, r00)
+                                else
+                                    rx = math.atan2(-r12, r11)
+                                    rz = 0
+                                end
+                                return rx, ry, rz
+                            end
+                        elseif cn == "Color3" then
+                            local r, g, b = args[1] or 0, args[2] or 0, args[3] or 0
+                            if k == "ToRGB" then return math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5) end
+                            if k == "ToHex" then return string.format("%02x%02x%02x", math.floor(r * 255 + 0.5), math.floor(g * 255 + 0.5), math.floor(b * 255 + 0.5)) end
+                            if k == "Lerp" then
+                                local ba = vecArgs(callArgs[1]) or {}
+                                local alpha = tonumber(callArgs[2]) or 0
+                                return makeDataProxy("Color3", {r + ((ba[1] or 0) - r) * alpha, g + ((ba[2] or 0) - g) * alpha, b + ((ba[3] or 0) - b) * alpha}, retName)
+                            end
                         end
                         return makeProxy(retName)
                     end
@@ -1073,69 +1296,57 @@ local function makeDataProxy(ctorName, ctorArgs, name)
                 return nil
             end,
             __mul = function(a, b)
-                local cn = rawget(a, "_ctorName") or ctorName
-                local v = genVar("v")
-                local sa = rawget(a, "_name") or cn
-                local sb = isProxy(b) and (rawget(b, "_name") or (getmetatable(b) and getmetatable(b)._ctorName) or "v") or tostring(b)
-                emit(string.format('local %s = %s * %s', v, sa, sb))
+                local retName = genVar("v")
+                if type(a) == "number" and ctorOf(b) == "Vector3" then
+                    local ba = vecArgs(b) or {}
+                    emit(string.format('local %s = %s * %s', retName, serialize(a), rawget(b, "_name") or "v"))
+                    return makeDataProxy("Vector3", {a * (ba[1] or 0), a * (ba[2] or 0), a * (ba[3] or 0)}, retName)
+                end
+                local cn = ctorOf(a) or ctorName
+                local sa = type(a) == "table" and (rawget(a, "_name") or cn) or serialize(a)
+                local sb = isProxy(b) and (rawget(b, "_name") or ((getmetatable(b) and getmetatable(b)._name) or "v")) or serialize(b)
+                emit(string.format('local %s = %s * %s', retName, sa, sb))
                 if cn == "CFrame" then
-                    local aa = rawget(a, "_ctorArgs") or {}
-                    local bc = isProxy(b) and (rawget(b, "_ctorName") or (getmetatable(b) and getmetatable(b)._ctorName)) or ""
+                    local bc = ctorOf(b)
                     if bc == "Vector3" then
-                        local ba = type(b) == "table" and rawget(b, "_ctorArgs") or {}
-                        return makeDataProxy("Vector3", {(aa[1] or 0)+(ba[1] or 0), (aa[2] or 0)+(ba[2] or 0), (aa[3] or 0)+(ba[3] or 0)}, v)
+                        local x, y, z = cfPoint(a, b)
+                        return makeDataProxy("Vector3", {x, y, z}, retName)
+                    elseif bc == "CFrame" then
+                        return makeDataProxy("CFrame", cfMulArgs(a, b), retName)
                     end
-                    local ba = type(b) == "table" and rawget(b, "_ctorArgs") or {}
-                    return makeDataProxy("CFrame", {(aa[1] or 0)+(ba[1] or 0), (aa[2] or 0)+(ba[2] or 0), (aa[3] or 0)+(ba[3] or 0)}, v)
                 end
-                local aa = rawget(a, "_ctorArgs") or {}
-                local ba = type(b) == "table" and rawget(b, "_ctorArgs") or {}
-                if aa and ba and aa[1] and ba[1] then
-                    return makeDataProxy(cn, {aa[1]*ba[1], aa[2]*ba[2], aa[3]*ba[3]}, v)
+                local aa, ba = vecArgs(a) or {}, vecArgs(b) or {}
+                if type(b) == "number" then
+                    return makeDataProxy(cn, {(aa[1] or 0) * b, (aa[2] or 0) * b, (aa[3] or 0) * b}, retName)
+                elseif cn == "Vector3" and ctorOf(b) == "Vector3" then
+                    return makeDataProxy(cn, {(aa[1] or 0) * (ba[1] or 0), (aa[2] or 0) * (ba[2] or 0), (aa[3] or 0) * (ba[3] or 0)}, retName)
                 end
-                if aa and type(b) == "number" then
-                    return makeDataProxy(cn, {aa[1]*b, aa[2]*b, aa[3]*b}, v)
-                end
-                return makeDataProxy(cn, {0, 0, 0}, v)
+                return makeProxy(retName)
             end,
             __add = function(a, b)
-                local aa = rawget(a, "_ctorArgs") or {}
-                local ba = type(b) == "table" and rawget(b, "_ctorArgs") or {}
-                if aa and ba and aa[1] and ba[1] then
-                    return makeDataProxy(rawget(a, "_ctorName") or "Vector3", {aa[1]+ba[1], aa[2]+ba[2], aa[3]+ba[3]}, (rawget(a,"_name") or "v").."+")
+                local aa, ba = vecArgs(a) or {}, vecArgs(b) or {}
+                if ctorOf(a) == "Vector3" and ctorOf(b) == "Vector3" then
+                    return makeDataProxy("Vector3", {(aa[1] or 0) + (ba[1] or 0), (aa[2] or 0) + (ba[2] or 0), (aa[3] or 0) + (ba[3] or 0)}, (rawget(a, "_name") or "v") .. "+")
                 end
-                if aa and type(b) == "number" then
-                    return makeDataProxy(rawget(a, "_ctorName") or "Vector3", {aa[1]+b, aa[2]+b, aa[3]+b}, (rawget(a,"_name") or "v").."+")
-                end
+                if type(b) == "number" then return makeDataProxy(ctorOf(a) or ctorName, {(aa[1] or 0) + b, (aa[2] or 0) + b, (aa[3] or 0) + b}, (rawget(a, "_name") or "v") .. "+") end
                 return makeProxy("v")
             end,
             __sub = function(a, b)
-                local aa = rawget(a, "_ctorArgs") or {}
-                local ba = type(b) == "table" and rawget(b, "_ctorArgs") or {}
-                if aa and ba and aa[1] and ba[1] then
-                    return makeDataProxy(rawget(a, "_ctorName") or "Vector3", {aa[1]+ba[1], aa[2]+ba[2], aa[3]+ba[3]}, (rawget(a,"_name") or "v").."+")
+                local aa, ba = vecArgs(a) or {}, vecArgs(b) or {}
+                if ctorOf(a) == "Vector3" and ctorOf(b) == "Vector3" then
+                    return makeDataProxy("Vector3", {(aa[1] or 0) - (ba[1] or 0), (aa[2] or 0) - (ba[2] or 0), (aa[3] or 0) - (ba[3] or 0)}, (rawget(a, "_name") or "v") .. "-")
                 end
-                if aa and type(b) == "number" then
-                    return makeDataProxy(rawget(a, "_ctorName") or "Vector3", {aa[1]+b, aa[2]+b, aa[3]+b}, (rawget(a,"_name") or "v").."+")
-                end
-                return makeProxy("v")
-            end,
-            __sub = function(a, b)
-                local aa = rawget(a, "_ctorArgs") or {}
-                local ba = type(b) == "table" and rawget(b, "_ctorArgs") or {}
-                if aa and ba and aa[1] and ba[1] then
-                    return makeDataProxy(rawget(a, "_ctorName") or "Vector3", {aa[1]-ba[1], aa[2]-ba[2], aa[3]-ba[3]}, (rawget(a,"_name") or "v").."-")
-                end
-                if aa and type(b) == "number" then
-                    return makeDataProxy(rawget(a, "_ctorName") or "Vector3", {aa[1]-b, aa[2]-b, aa[3]-b}, (rawget(a,"_name") or "v").."-")
-                end
+                if type(b) == "number" then return makeDataProxy(ctorOf(a) or ctorName, {(aa[1] or 0) - b, (aa[2] or 0) - b, (aa[3] or 0) - b}, (rawget(a, "_name") or "v") .. "-") end
                 return makeProxy("v")
             end,
             __div = function(a, b)
-                local aa = rawget(a, "_ctorArgs") or {}
-                if aa and type(b) == "number" then
-                    return makeDataProxy(rawget(a, "_ctorName") or "Vector3", {aa[1]/b, aa[2]/b, aa[3]/b}, (rawget(a,"_name") or "v").."/")
-                end
+                local aa = vecArgs(a) or {}
+                if type(b) == "number" then return makeDataProxy(ctorOf(a) or ctorName, {(aa[1] or 0) / b, (aa[2] or 0) / b, (aa[3] or 0) / b}, (rawget(a, "_name") or "v") .. "/") end
+                return makeProxy("v")
+            end,
+            __unm = function(a)
+                local aa = vecArgs(a) or {}
+                if ctorOf(a) == "Vector3" or ctorOf(a) == "Vector2" then return makeDataProxy(ctorOf(a), {-(aa[1] or 0), -(aa[2] or 0), -(aa[3] or 0)}, "-" .. (rawget(a, "_name") or "v")) end
                 return makeProxy("v")
             end,
         }
@@ -1389,7 +1600,480 @@ local parentChildMap: { [string]: { [string]: any } } = {}
 local workspaceProxy: any = nil
 local awakePartsCount = 0
 local unanchoredParts = setmetatable({}, { __mode = "k" })
+local spatialParts = setmetatable({}, { __mode = "k" })
+local partJoints = setmetatable({}, { __mode = "k" })
+local jointEndpoints = setmetatable({}, { __mode = "k" })
+local collisionGroups = { Default = 0 }
+local collisionGroupNames = { [0] = "Default" }
+local collisionPairs = {}
+local nextCollisionGroupId = 1
 local _realCollectgarbage = collectgarbage
+
+local function isSpatialPartClass(className)
+    return className == "Part" or className == "BasePart" or className == "MeshPart" or className == "WedgePart" or className == "CornerWedgePart" or className == "TrussPart" or className == "UnionOperation" or className == "NegateOperation" or className == "Seat" or className == "VehicleSeat"
+end
+
+local function storedOf(v, key)
+    if not isProxy(v) then return nil end
+    local m = getmetatable(v)
+    return m and m._storedValues and m._storedValues[key] or nil
+end
+
+local function jointBucket(part)
+    local bucket = partJoints[part]
+    if not bucket then
+        bucket = setmetatable({}, { __mode = "k" })
+        partJoints[part] = bucket
+    end
+    return bucket
+end
+
+local function setJointEndpoint(joint, key, part)
+    local endpoints = jointEndpoints[joint]
+    if not endpoints then
+        endpoints = {}
+        jointEndpoints[joint] = endpoints
+    end
+    local old = endpoints[key]
+    if isProxy(old) and partJoints[old] then partJoints[old][joint] = nil end
+    endpoints[key] = isProxy(part) and part or nil
+    if isProxy(part) then jointBucket(part)[joint] = true end
+end
+
+local function removeJoint(joint)
+    local endpoints = jointEndpoints[joint]
+    if not endpoints then return end
+    for _, part in pairs(endpoints) do
+        if isProxy(part) and partJoints[part] then partJoints[part][joint] = nil end
+    end
+    jointEndpoints[joint] = nil
+end
+
+local function connectedParts(part, recursive)
+    local result = {}
+    local seen = {[part] = true}
+    local queue = {part}
+    local qi = 1
+    while qi <= #queue do
+        local current = queue[qi]
+        qi += 1
+        local bucket = partJoints[current]
+        if bucket then
+            for joint in pairs(bucket) do
+                local endpoints = jointEndpoints[joint]
+                if endpoints then
+                    for _, other in pairs(endpoints) do
+                        if isProxy(other) and not seen[other] then
+                            seen[other] = true
+                            result[#result + 1] = other
+                            if recursive then queue[#queue + 1] = other end
+                        end
+                    end
+                end
+            end
+        end
+        if not recursive then break end
+    end
+    return result
+end
+
+local function jointsForPart(part)
+    local result = {}
+    local bucket = partJoints[part]
+    if bucket then
+        for joint in pairs(bucket) do result[#result + 1] = joint end
+    end
+    return result
+end
+
+local function collisionPairKey(a, b)
+    if a > b then a, b = b, a end
+    return a .. "\0" .. b
+end
+
+local function groupsCollidable(a, b)
+    a = type(a) == "string" and a or "Default"
+    b = type(b) == "string" and b or "Default"
+    local v = collisionPairs[collisionPairKey(a, b)]
+    return v == nil and true or v
+end
+
+local function enumNameOf(v)
+    if not isProxy(v) then return nil end
+    local m = getmetatable(v)
+    if not m then return nil end
+    if m._storedValues and type(m._storedValues["Name"]) == "string" then return m._storedValues["Name"] end
+    local n = m._name or rawget(v, "_name")
+    if type(n) == "string" then return n:match("%.([^%.]+)$") end
+    return nil
+end
+
+local function isDescendantOrSelf(v, root)
+    if not isProxy(v) or not isProxy(root) then return false end
+    local cur = v
+    for _ = 1, 128 do
+        if rawequal(cur, root) then return true end
+        local m = getmetatable(cur)
+        cur = m and m._storedValues and m._storedValues["Parent"] or nil
+        if not isProxy(cur) then return false end
+    end
+    return false
+end
+
+local function filterAllows(part, params)
+    if not isProxy(params) then return true end
+    local pm = getmetatable(params)
+    local sv = pm and pm._storedValues or nil
+    if not sv then return true end
+    local queryGroup = sv["CollisionGroup"]
+    if type(queryGroup) == "string" then
+        local partGroup = storedOf(part, "CollisionGroup") or "Default"
+        if not groupsCollidable(queryGroup, partGroup) then return false end
+    end
+    if sv["RespectCanCollide"] == true and storedOf(part, "CanCollide") == false then return false end
+    local list = sv["FilterDescendantsInstances"]
+    if type(list) ~= "table" or #list == 0 then return true end
+    local matched = false
+    for _, root in ipairs(list) do
+        if isProxy(root) and isDescendantOrSelf(part, root) then matched = true break end
+    end
+    local filterName = enumNameOf(sv["FilterType"])
+    if filterName == "Include" or filterName == "Whitelist" then return matched end
+    return not matched
+end
+
+local function partFrame(part)
+    local cf = storedOf(part, "CFrame")
+    if ctorOf(cf) == "CFrame" then return cf end
+    local pos = storedOf(part, "Position")
+    local pa = vecArgs(pos) or {}
+    return makeDataProxy("CFrame", {pa[1] or 0, pa[2] or 0, pa[3] or 0, 1, 0, 0, 0, 1, 0, 0, 0, 1}, "partcf")
+end
+
+local function partSize(part)
+    local size = storedOf(part, "Size")
+    if ctorOf(size) == "Vector3" then return size end
+    return makeDataProxy("Vector3", {4, 1, 2}, "partsize")
+end
+
+local function numericVec(v)
+    local a = vecArgs(v) or {}
+    return {a[1] or 0, a[2] or 0, a[3] or 0}
+end
+
+local function dot3(a, b)
+    return a[1] * b[1] + a[2] * b[2] + a[3] * b[3]
+end
+
+local function crossVec(a, b)
+    return {a[2] * b[3] - a[3] * b[2], a[3] * b[1] - a[1] * b[3], a[1] * b[2] - a[2] * b[1]}
+end
+
+local function cfAxes(cf)
+    local x, y, z, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cfValues(cf)
+    return {x, y, z}, {{r00, r10, r20}, {r01, r11, r21}, {r02, r12, r22}}
+end
+
+local function obbIntersects(cfA, sizeA, cfB, sizeB)
+    local ca, aa = cfAxes(cfA)
+    local cb, ba = cfAxes(cfB)
+    local sa, sb = numericVec(sizeA), numericVec(sizeB)
+    local ea = {math.abs(sa[1]) * 0.5, math.abs(sa[2]) * 0.5, math.abs(sa[3]) * 0.5}
+    local eb = {math.abs(sb[1]) * 0.5, math.abs(sb[2]) * 0.5, math.abs(sb[3]) * 0.5}
+    local r, ar = {{}, {}, {}}, {{}, {}, {}}
+    for i = 1, 3 do
+        for j = 1, 3 do
+            r[i][j] = dot3(aa[i], ba[j])
+            ar[i][j] = math.abs(r[i][j]) + 1e-8
+        end
+    end
+    local d = {cb[1] - ca[1], cb[2] - ca[2], cb[3] - ca[3]}
+    local t = {dot3(d, aa[1]), dot3(d, aa[2]), dot3(d, aa[3])}
+    for i = 1, 3 do
+        local rb = eb[1] * ar[i][1] + eb[2] * ar[i][2] + eb[3] * ar[i][3]
+        if math.abs(t[i]) > ea[i] + rb then return false end
+    end
+    for j = 1, 3 do
+        local ra = ea[1] * ar[1][j] + ea[2] * ar[2][j] + ea[3] * ar[3][j]
+        local tv = math.abs(t[1] * r[1][j] + t[2] * r[2][j] + t[3] * r[3][j])
+        if tv > ra + eb[j] then return false end
+    end
+    for i = 1, 3 do
+        local i1, i2 = i % 3 + 1, (i + 1) % 3 + 1
+        for j = 1, 3 do
+            local j1, j2 = j % 3 + 1, (j + 1) % 3 + 1
+            local ra = ea[i1] * ar[i2][j] + ea[i2] * ar[i1][j]
+            local rb = eb[j1] * ar[i][j2] + eb[j2] * ar[i][j1]
+            local tv = math.abs(t[i2] * r[i1][j] - t[i1] * r[i2][j])
+            if tv > ra + rb then return false end
+        end
+    end
+    return true
+end
+
+local function sphereIntersectsPart(position, radius, part)
+    local cf, size = partFrame(part), partSize(part)
+    local lx, ly, lz = cfObjectPoint(cf, position)
+    local s = numericVec(size)
+    local hx, hy, hz = math.abs(s[1]) * 0.5, math.abs(s[2]) * 0.5, math.abs(s[3]) * 0.5
+    local cx = math.max(-hx, math.min(hx, lx))
+    local cy = math.max(-hy, math.min(hy, ly))
+    local cz = math.max(-hz, math.min(hz, lz))
+    local dx, dy, dz = lx - cx, ly - cy, lz - cz
+    return dx * dx + dy * dy + dz * dz <= radius * radius
+end
+
+local function closestPointOnPart(part, position)
+    local cf, size = partFrame(part), partSize(part)
+    local lx, ly, lz = cfObjectPoint(cf, position)
+    local s = numericVec(size)
+    local hx, hy, hz = math.abs(s[1]) * 0.5, math.abs(s[2]) * 0.5, math.abs(s[3]) * 0.5
+    local localPoint = makeDataProxy("Vector3", {math.max(-hx, math.min(hx, lx)), math.max(-hy, math.min(hy, ly)), math.max(-hz, math.min(hz, lz))}, "closest_local")
+    local x, y, z = cfPoint(cf, localPoint)
+    return makeDataProxy("Vector3", {x, y, z}, "closest")
+end
+
+local function eachSpatialCandidate(params, callback)
+    local maxParts = math.huge
+    if isProxy(params) then
+        local pm = getmetatable(params)
+        local v = pm and pm._storedValues and pm._storedValues["MaxParts"] or nil
+        if type(v) == "number" and v > 0 then maxParts = math.floor(v) end
+    end
+    local count = 0
+    for part in pairs(spatialParts) do
+        if isProxy(part) then
+            local m = getmetatable(part)
+            local sv = m and m._storedValues
+            if sv and sv["Parent"] ~= nil and sv["CanQuery"] ~= false and not destroyedInstances[m._name or ""] and (workspaceProxy == nil or isDescendantOrSelf(part, workspaceProxy)) and filterAllows(part, params) then
+                count += 1
+                if callback(part) == false or count >= maxParts then break end
+            end
+        end
+    end
+    return count
+end
+
+local function spatialCandidates(params)
+    local out = {}
+    eachSpatialCandidate(params, function(part)
+        out[#out + 1] = part
+    end)
+    return out
+end
+
+local function rayObb(origin, direction, part, inflate)
+    local cf, size = partFrame(part), partSize(part)
+    local o = {cfObjectPoint(cf, origin)}
+    local d = {cfObjectVector(cf, direction)}
+    local s = numericVec(size)
+    local inf = inflate or {0, 0, 0}
+    local half = {math.abs(s[1]) * 0.5 + (inf[1] or 0), math.abs(s[2]) * 0.5 + (inf[2] or 0), math.abs(s[3]) * 0.5 + (inf[3] or 0)}
+    local tmin, tmax = 0, 1
+    local normal = {0, 0, 0}
+    for axis = 1, 3 do
+        local ov, dv, hv = o[axis], d[axis], half[axis]
+        if math.abs(dv) < 1e-12 then
+            if ov < -hv or ov > hv then return nil end
+        else
+            local t1, t2 = (-hv - ov) / dv, (hv - ov) / dv
+            local n1, n2 = -1, 1
+            if t1 > t2 then t1, t2, n1, n2 = t2, t1, n2, n1 end
+            if t1 > tmin then
+                tmin = t1
+                normal = {0, 0, 0}
+                normal[axis] = n1
+            end
+            if t2 < tmax then tmax = t2 end
+            if tmin > tmax then return nil end
+        end
+    end
+    if tmin < 0 or tmin > 1 then return nil end
+    local oa, da = numericVec(origin), numericVec(direction)
+    local hx, hy, hz = oa[1] + da[1] * tmin, oa[2] + da[2] * tmin, oa[3] + da[3] * tmin
+    local nproxy = makeDataProxy("Vector3", normal, "raynormal_local")
+    local nx, ny, nz = cfVector(cf, nproxy)
+    local mag = math.sqrt(da[1] * da[1] + da[2] * da[2] + da[3] * da[3])
+    return tmin, makeDataProxy("Vector3", {hx, hy, hz}, "rayhit"), makeDataProxy("Vector3", {nx, ny, nz}, "raynormal"), mag * tmin
+end
+
+local function makeSpatialHit(name, part, position, normal, distance)
+    local hit = makeProxy(name)
+    local hm = getmetatable(hit)
+    hm._className = "RaycastResult"
+    hm._storedValues["Instance"] = part
+    hm._setKeys["Instance"] = true
+    hm._storedValues["Position"] = position
+    hm._setKeys["Position"] = true
+    hm._storedValues["Normal"] = normal
+    hm._setKeys["Normal"] = true
+    hm._storedValues["Distance"] = distance
+    hm._setKeys["Distance"] = true
+    hm._storedValues["Material"] = storedOf(part, "Material")
+    hm._setKeys["Material"] = true
+    return hit
+end
+
+local function massOfPart(part)
+    local size = numericVec(partSize(part))
+    local density = 0.7
+    local props = storedOf(part, "CustomPhysicalProperties")
+    if isProxy(props) then
+        local pa = vecArgs(props)
+        if pa and type(pa[1]) == "number" then density = pa[1] end
+    end
+    if storedOf(part, "Massless") == true then return 0 end
+    return math.abs(size[1] * size[2] * size[3]) * math.max(0, density)
+end
+
+local function assemblyParts(part)
+    local result = {part}
+    local connected = connectedParts(part, true)
+    for i = 1, #connected do result[#result + 1] = connected[i] end
+    return result
+end
+
+local function assemblyRoot(part)
+    local parts = assemblyParts(part)
+    local best = part
+    local bestAnchored = storedOf(part, "Anchored") == true and 1 or 0
+    local bestPriority = tonumber(storedOf(part, "RootPriority")) or 0
+    for i = 2, #parts do
+        local current = parts[i]
+        local anchored = storedOf(current, "Anchored") == true and 1 or 0
+        local priority = tonumber(storedOf(current, "RootPriority")) or 0
+        if anchored > bestAnchored or anchored == bestAnchored and priority > bestPriority then
+            best = current
+            bestAnchored = anchored
+            bestPriority = priority
+        end
+    end
+    return best
+end
+
+local function assemblyMassAndCenter(part)
+    local parts = assemblyParts(part)
+    local total = 0
+    local x, y, z = 0, 0, 0
+    for i = 1, #parts do
+        local current = parts[i]
+        local mass = massOfPart(current)
+        local pos = numericVec(partFrame(current).Position)
+        total += mass
+        x += pos[1] * mass
+        y += pos[2] * mass
+        z += pos[3] * mass
+    end
+    if total <= 0 then
+        local pos = numericVec(partFrame(part).Position)
+        return 0, pos
+    end
+    return total, {x / total, y / total, z / total}
+end
+
+local function attachmentWorldFrame(attachment)
+    local localCf = storedOf(attachment, "CFrame")
+    if ctorOf(localCf) ~= "CFrame" then
+        local pos = storedOf(attachment, "Position")
+        local a = vecArgs(pos) or {}
+        localCf = makeDataProxy("CFrame", {a[1] or 0, a[2] or 0, a[3] or 0, 1, 0, 0, 0, 1, 0, 0, 0, 1}, "attachmentcf")
+    end
+    local parent = storedOf(attachment, "Parent")
+    if isProxy(parent) and isSpatialPartClass((getmetatable(parent) and getmetatable(parent)._className) or "") then
+        return makeDataProxy("CFrame", cfMulArgs(partFrame(parent), localCf), "attachmentworld")
+    end
+    return localCf
+end
+
+local function constraintDistance(constraint)
+    local a0 = storedOf(constraint, "Attachment0")
+    local a1 = storedOf(constraint, "Attachment1")
+    if not isProxy(a0) or not isProxy(a1) then return 0 end
+    local p0 = numericVec(attachmentWorldFrame(a0).Position)
+    local p1 = numericVec(attachmentWorldFrame(a1).Position)
+    local dx, dy, dz = p1[1] - p0[1], p1[2] - p0[2], p1[3] - p0[3]
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+local function terrainState(terrain)
+    local mt = getmetatable(terrain)
+    if not mt._terrainOps then mt._terrainOps = {} end
+    if not mt._terrainColors then mt._terrainColors = {} end
+    return mt._terrainOps, mt._terrainColors
+end
+
+local function regionBounds(region)
+    if not isProxy(region) then return nil end
+    local mt = getmetatable(region)
+    if not mt or mt._ctorName ~= "Region3" then return nil end
+    local args = mt._ctorArgs or {}
+    local a, b = vecArgs(args[1]) or {}, vecArgs(args[2]) or {}
+    local minx, miny, minz = math.min(a[1] or 0, b[1] or 0), math.min(a[2] or 0, b[2] or 0), math.min(a[3] or 0, b[3] or 0)
+    local maxx, maxy, maxz = math.max(a[1] or 0, b[1] or 0), math.max(a[2] or 0, b[2] or 0), math.max(a[3] or 0, b[3] or 0)
+    return minx, miny, minz, maxx, maxy, maxz
+end
+
+local function materialName(material)
+    return enumNameOf(material) or tostring(material or "Air")
+end
+
+local function terrainSample(terrain, x, y, z)
+    local ops = terrainState(terrain)
+    local material = nil
+    local occupancy = 0
+    for i = 1, #ops do
+        local op = ops[i]
+        local inside = false
+        if op.kind == "block" then
+            local cx, cy, cz, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cfValues(op.cf)
+            local px, py, pz = x - cx, y - cy, z - cz
+            local lx, ly, lz = r00 * px + r10 * py + r20 * pz, r01 * px + r11 * py + r21 * pz, r02 * px + r12 * py + r22 * pz
+            local size = numericVec(op.size)
+            inside = math.abs(lx) <= math.abs(size[1]) * 0.5 and math.abs(ly) <= math.abs(size[2]) * 0.5 and math.abs(lz) <= math.abs(size[3]) * 0.5
+        elseif op.kind == "ball" then
+            local p = numericVec(op.position)
+            local dx, dy, dz = x - p[1], y - p[2], z - p[3]
+            inside = dx * dx + dy * dy + dz * dz <= op.radius * op.radius
+        elseif op.kind == "region" or op.kind == "replace" then
+            inside = x >= op.minx and x <= op.maxx and y >= op.miny and y <= op.maxy and z >= op.minz and z <= op.maxz
+        elseif op.kind == "cells" then
+            local ix = math.floor((x - op.minx) / op.resolution) + 1
+            local iy = math.floor((y - op.miny) / op.resolution) + 1
+            local iz = math.floor((z - op.minz) / op.resolution) + 1
+            local mx = op.materials[ix]
+            local ox = op.occupancy[ix]
+            if mx and ox and mx[iy] and ox[iy] and mx[iy][iz] ~= nil and ox[iy][iz] ~= nil then
+                material = mx[iy][iz]
+                occupancy = math.max(0, math.min(1, tonumber(ox[iy][iz]) or 0))
+            end
+        end
+        if inside then
+            if op.kind == "replace" then
+                if materialName(material) == op.fromName then material = op.toMaterial end
+            else
+                material = op.material
+                occupancy = materialName(material) == "Air" and 0 or 1
+            end
+        end
+    end
+    if material == nil then
+        local envRef = _G._envRef
+        material = envRef and envRef.Enum and envRef.Enum.Material and envRef.Enum.Material.Air or nil
+    end
+    return material, occupancy
+end
+
+local function castInflate(targetCf, castCf, castSize)
+    local _, ta = cfAxes(targetCf)
+    local _, ca = cfAxes(castCf)
+    local s = numericVec(castSize)
+    local e = {math.abs(s[1]) * 0.5, math.abs(s[2]) * 0.5, math.abs(s[3]) * 0.5}
+    return {
+        e[1] * math.abs(dot3(ta[1], ca[1])) + e[2] * math.abs(dot3(ta[1], ca[2])) + e[3] * math.abs(dot3(ta[1], ca[3])),
+        e[1] * math.abs(dot3(ta[2], ca[1])) + e[2] * math.abs(dot3(ta[2], ca[2])) + e[3] * math.abs(dot3(ta[2], ca[3])),
+        e[1] * math.abs(dot3(ta[3], ca[1])) + e[2] * math.abs(dot3(ta[3], ca[2])) + e[3] * math.abs(dot3(ta[3], ca[3])),
+    }
+end
 
 local function firePropertyChange(proxyNameStr: string, fieldName: string, value: any)
     local key = proxyNameStr .. "." .. fieldName
@@ -1794,8 +2478,7 @@ local classDefaultProperties: { [string]: { [string]: any } } = {
         Color = "Color3", Decay = "Color3", Density = 0.395, Glare = 0, Haze = 0, Offset = 0,
     },
     Attachment = {
-        Axis = "Vector3", CFrame = "CFrame", SecondaryAxis = "Vector3", Visible = false, WorldAxis = "Vector3",
-        WorldCFrame = "CFrame", WorldSecondaryAxis = "Vector3",
+        Axis = "Vector3", CFrame = "CFrame", SecondaryAxis = "Vector3", Visible = false,
     },
     AudioAnalyzer = {
         SpectrumEnabled = false,
@@ -1891,7 +2574,7 @@ local classDefaultProperties: { [string]: { [string]: any } } = {
     BasePart = {
         Anchored = false, AssemblyAngularVelocity = "Vector3", AssemblyLinearVelocity = "Vector3",
         AudioCanCollide = false, CFrame = "CFrame", CanCollide = true, CanQuery = true, CanTouch = true,
-        CastShadow = true, CollisionGroup = "", Color = "Color3", EnableFluidForces = false, Locked = false,
+        CastShadow = true, CollisionGroup = "Default", Color = "Color3", EnableFluidForces = false, Locked = false,
         Massless = false, MaterialVariant = "", PivotOffset = "CFrame", Reflectance = 0, RootPriority = 0,
         Rotation = "Vector3", Size = "Vector3", Transparency = 0, CanFrameCached = true, Archivable = true,
         FrontParamA = -0.5, FrontParamB = 0.5, BackParamA = -0.5, BackParamB = 0.5, LeftParamA = -0.5,
@@ -2969,6 +3652,65 @@ local classDefaultProperties: { [string]: { [string]: any } } = {
 }
 
 
+local PROXY_INHERENT_SERVICE_METHODS = {
+    RunService = { GetRealPhysicsFPS = true, GetPhysicsFPS = true, IsStudio = true },
+    SoundService = { GetMixerTime = true, GetAudioInstances = true, GetInputDevices = true, GetOutputDevices = true },
+    ReflectionService = { GetClasses = true, GetMembers = true, GetProperties = true, GetFunctions = true, GetEvents = true, GetEnums = true },
+    StarterGui = { GetCore = true, SetCore = true, RegisterGetCore = true, RegisterSetCore = true },
+    VoiceChatService = {
+        getInternalSessionId = true, getInternalChannelId = true,
+        getInternalGroupId = true, isInternalPublishPaused = true,
+        lastVoiceChatStats = true, joinVoice = true, rejoinVoice = true, leaveVoice = true,
+    },
+}
+
+local PROXY_DATA_TYPE_METHODS = {
+    Color3 = { Lerp = true, ToHSV = true, ToHex = true, ToRGB = true },
+    Vector3 = { Lerp = true, Dot = true, Cross = true, Angle = true, FuzzyEq = true, Abs = true, Unit = true },
+    Vector2 = { Lerp = true, Dot = true, Cross = true, Abs = true },
+    UDim2 = { Lerp = true },
+    CFrame = { Lerp = true, ToOrientation = true, ToEulerAnglesXYZ = true, ToEulerAnglesYXZ = true, PointToObjectSpace = true, ToWorldSpace = true, ToObjectSpace = true, Inverse = true },
+    UDim = { Lerp = true },
+    Region3 = { ExpandToGrid = true },
+    Ray = { ClosestPoint = true, Distance = true },
+}
+
+local PROXY_ALWAYS_AVAILABLE_METHODS = {
+    IsA = true, GetChildren = true, GetDescendants = true,
+    GetFullName = true, FindFirstChild = true, FindFirstDescendant = true,
+    FindFirstAncestor = true, FindFirstChildWhichIsA = true,
+    FindFirstChildOfClass = true, FindFirstAncestorWhichIsA = true,
+    FindFirstAncestorOfClass = true, GetDebugId = true,
+    GetTags = true, AddTag = true, RemoveTag = true,
+    HasTag = true, GetAttribute = true, GetAttributes = true,
+    SetAttribute = true, GetPropertyChangedSignal = true,
+    IsDescendantOf = true, IsAncestorOf = true,
+    Clone = true, Destroy = true, Remove = true,
+    ClearAllChildren = true, GetAttributeChangedSignal = true,
+    NextNumber = true, NextInteger = true, NextUnitVector = true,
+}
+
+local PROXY_STATEMENT_METHODS = {
+    Connect = true, connect = true, ConnectParallel = true, Once = true, Disconnect = true,
+    Wait = true, wait = true, Destroy = true, Remove = true, ClearAllChildren = true,
+    DisconnectAll = true, Init = true, Notify = true, Play = true, Pause = true, Cancel = true,
+    FireServer = true, FireClient = true, FireAllClients = true, InvokeServer = true, InvokeClient = true,
+    Set = true, set = true, Add = true, CaptureController = true, ClickButton1 = true, ClickButton2 = true,
+    GetChildren = true, GetDescendants = true, GetFullName = true, IsA = true, Clone = true, IsDescendantOf = true,
+    GetAsync = true, PostAsync = true, RequestAsync = true, HttpGet = true, HttpPost = true, HttpRequest = true,
+    JSONEncode = true, JSONDecode = true, SetCore = true, GetCore = true, FindFirstChild = true, WaitForChild = true,
+    FindFirstDescendant = true, FindFirstAncestor = true, SetMetadata = true, GetMetadata = true,
+    SetItem = true, GetItem = true, IsVibrationSupported = true, GetCorescriptLocalizations = true,
+    IsAvailable = true, HasAchieved = true, GetRealPhysicsFPS = true, GetPhysicsFPS = true,
+    PreloadAsync = true, SendKeyEvent = true, GetDebugId = true, Create = true, SendAsync = true,
+    ApplyAngularImpulse = true, ApplyImpulse = true, ApplyLinearImpulse = true, ApplyImpulseAtPosition = true,
+    GetPlayerFromCharacter = true, ReadVoxels = true, WriteVoxels = true, FillBlock = true, FillBall = true,
+    FillRegion = true, ReplaceMaterial = true, Clear = true, SetMaterialColor = true,
+    RegisterCollisionGroup = true, CreateCollisionGroup = true, UnregisterCollisionGroup = true,
+    RemoveCollisionGroup = true, CollisionGroupSetCollidable = true, RenameCollisionGroup = true,
+    SetPartCollisionGroup = true, SetSource = true, GetSource = true,
+}
+
 makeProxy = function(name: string): any
     local children = {}
     local storedValues = {}
@@ -3108,18 +3850,7 @@ makeProxy = function(name: string): any
             end
             return children[ks]
         end
-        local INHERENT_SERVICE_METHODS = {
-            RunService = { GetRealPhysicsFPS = true, GetPhysicsFPS = true, IsStudio = true },
-            SoundService = { GetMixerTime = true, GetAudioInstances = true, GetInputDevices = true, GetOutputDevices = true },
-            ReflectionService = { GetClasses = true, GetMembers = true, GetProperties = true, GetFunctions = true, GetEvents = true, GetEnums = true },
-            StarterGui = { GetCore = true, SetCore = true, RegisterGetCore = true, RegisterSetCore = true },
-            VoiceChatService = {
-                getInternalSessionId = true, getInternalChannelId = true,
-                getInternalGroupId = true, isInternalPublishPaused = true,
-                lastVoiceChatStats = true, joinVoice = true, rejoinVoice = true, leaveVoice = true,
-            },
-        }
-        local inherentMethods = mt._className and INHERENT_SERVICE_METHODS[mt._className] or nil
+        local inherentMethods = mt._className and PROXY_INHERENT_SERVICE_METHODS[mt._className] or nil
         if inherentMethods and inherentMethods[ks] then
             if not children[ks] then
                 local parentRef = t
@@ -3173,16 +3904,40 @@ makeProxy = function(name: string): any
                 return v
             end
         end
+        local clsForSpecial = mt._className or ""
+        if isSpatialPartClass(clsForSpecial) then
+            if ks == "AssemblyRootPart" then return assemblyRoot(t) end
+            if ks == "AssemblyMass" then
+                local mass = assemblyMassAndCenter(t)
+                return mass
+            end
+            if ks == "AssemblyCenterOfMass" then
+                local _, center = assemblyMassAndCenter(t)
+                return makeDataProxy("Vector3", center, name .. ".AssemblyCenterOfMass")
+            end
+            if ks == "CollisionGroupId" then
+                return collisionGroups[storedValues["CollisionGroup"] or "Default"] or 0
+            end
+        end
+        if clsForSpecial == "Attachment" then
+            if ks == "WorldCFrame" then return attachmentWorldFrame(t) end
+            if ks == "WorldPosition" then return attachmentWorldFrame(t).Position end
+            if ks == "WorldAxis" or ks == "WorldSecondaryAxis" then
+                local localAxis = storedValues[ks == "WorldAxis" and "Axis" or "SecondaryAxis"]
+                if ctorOf(localAxis) ~= "Vector3" then localAxis = makeDataProxy("Vector3", ks == "WorldAxis" and {1, 0, 0} or {0, 1, 0}, name .. ".axis") end
+                local parent = storedValues["Parent"]
+                if isProxy(parent) and isSpatialPartClass((getmetatable(parent) and getmetatable(parent)._className) or "") then
+                    local x, y, z = cfVector(partFrame(parent), localAxis)
+                    return makeDataProxy("Vector3", {x, y, z}, name .. "." .. ks)
+                end
+                return localAxis
+            end
+        end
+        if classIsA(clsForSpecial, "Constraint") then
+            if ks == "CurrentDistance" or ks == "CurrentLength" then return constraintDistance(t) end
+        end
         local memberInfo = resolveApiMember(mt._className or "", ks)
-        local DATA_TYPE_METHODS = {
-            Color3 = { Lerp = true, ToHSV = true, ToHex = true, ToRGB = true },
-            Vector3 = { Lerp = true, Dot = true, Cross = true, Angle = true, FuzzyEq = true, Abs = true, Unit = true },
-            Vector2 = { Lerp = true, Dot = true, Cross = true, Abs = true },
-            UDim2 = { Lerp = true },
-            CFrame = { Lerp = true, ToOrientation = true, ToEulerAnglesXYZ = true, ToEulerAnglesYXZ = true, PointToObjectSpace = true, ToWorldSpace = true, ToObjectSpace = true, Inverse = true },
-            UDim = { Lerp = true },
-        }
-        if ctorName and DATA_TYPE_METHODS[ctorName] and DATA_TYPE_METHODS[ctorName][ks] then
+        if ctorName and PROXY_DATA_TYPE_METHODS[ctorName] and PROXY_DATA_TYPE_METHODS[ctorName][ks] then
             if not children[ks] then
                 local parentRef = t
                 local fieldNameStr = ks
@@ -3196,21 +3951,7 @@ makeProxy = function(name: string): any
             end
             return children[ks]
         end
-        local ALWAYS_AVAILABLE_METHODS = {
-            IsA = true, GetChildren = true, GetDescendants = true,
-            GetFullName = true, FindFirstChild = true, FindFirstDescendant = true,
-            FindFirstAncestor = true, FindFirstChildWhichIsA = true,
-            FindFirstChildOfClass = true, FindFirstAncestorWhichIsA = true,
-            FindFirstAncestorOfClass = true, GetDebugId = true,
-            GetTags = true, AddTag = true, RemoveTag = true,
-            HasTag = true, GetAttribute = true, GetAttributes = true,
-            SetAttribute = true, GetPropertyChangedSignal = true,
-            IsDescendantOf = true, IsAncestorOf = true,
-            Clone = true, Destroy = true, Remove = true,
-            ClearAllChildren = true, GetAttributeChangedSignal = true,
-            NextNumber = true, NextInteger = true, NextUnitVector = true,
-        }
-        if ALWAYS_AVAILABLE_METHODS[ks] and not children[ks] then
+        if PROXY_ALWAYS_AVAILABLE_METHODS[ks] and not children[ks] then
             local parentRef = t
             local fieldNameStr = ks
             children[ks] = function(_, ...)
@@ -3356,8 +4097,16 @@ makeProxy = function(name: string): any
             local idx = ({ Min = 1, Max = 2 })[ks]
             return mt._ctorArgs[idx] or makeProxy(name .. "." .. ks)
         end
-        if mt._ctorName == "Region3" and ks == "Size" then
-            return makeProxy(name .. ".Size")
+        if mt._ctorName == "Region3" and (ks == "Min" or ks == "Max" or ks == "Size" or ks == "CFrame") then
+            local a = mt._ctorArgs or {}
+            local minv, maxv = a[1], a[2]
+            local mina, maxa = vecArgs(minv) or {}, vecArgs(maxv) or {}
+            local minx, miny, minz = math.min(mina[1] or 0, maxa[1] or 0), math.min(mina[2] or 0, maxa[2] or 0), math.min(mina[3] or 0, maxa[3] or 0)
+            local maxx, maxy, maxz = math.max(mina[1] or 0, maxa[1] or 0), math.max(mina[2] or 0, maxa[2] or 0), math.max(mina[3] or 0, maxa[3] or 0)
+            if ks == "Min" then return makeDataProxy("Vector3", {minx, miny, minz}, name .. ".Min") end
+            if ks == "Max" then return makeDataProxy("Vector3", {maxx, maxy, maxz}, name .. ".Max") end
+            if ks == "Size" then return makeDataProxy("Vector3", {maxx - minx, maxy - miny, maxz - minz}, name .. ".Size") end
+            return makeDataProxy("CFrame", {(minx + maxx) * 0.5, (miny + maxy) * 0.5, (minz + maxz) * 0.5, 1, 0, 0, 0, 1, 0, 0, 0, 1}, name .. ".CFrame")
         end
         if mt._ctorName == "PathWaypoint" and (ks == "Position" or ks == "Action") then
             local idx = ({ Position = 1, Action = 2 })[ks]
@@ -3370,17 +4119,10 @@ makeProxy = function(name: string): any
             return defaults[ks]
         end
         if mt._ctorName == "PhysicalProperties" and (ks == "Friction" or ks == "Elasticity" or ks == "ElasticityWeight" or ks == "FrictionWeight" or ks == "Density") then
-            local idx = ({ Friction = 1, Elasticity = 2, ElasticityWeight = 3, FrictionWeight = 4, Density = 5 })[ks]
+            local idx = ({ Density = 1, Friction = 2, Elasticity = 3, FrictionWeight = 4, ElasticityWeight = 5 })[ks]
             local val = mt._ctorArgs and mt._ctorArgs[idx]
             if type(val) == "number" then return val end
             return 0
-        end
-        if mt._ctorName == "Region3" and ks == "Size" then
-            local v = makeProxy(name .. ".Size")
-            local vmt = getmetatable(v)
-            vmt._ctorName = "Vector3"
-            vmt._ctorArgs = { 0, 0, 0 }
-            return v
         end
         if mt._ctorName == "Region3int16" and (ks == "Min" or ks == "Max") then
             local idx = ({ Min = 1, Max = 2 })[ks]
@@ -3580,6 +4322,51 @@ makeProxy = function(name: string): any
         end
         storedValues[ks] = v
         setKeys[ks] = true
+        if (ks == "Part0" or ks == "Part1") and (classIsA(cls, "JointInstance") or cls == "WeldConstraint") then
+            setJointEndpoint(t, ks, v)
+        end
+        if ks == "CollisionGroup" and isSpatialPartClass(cls) then
+            local groupName = tostring(v or "Default")
+            if collisionGroups[groupName] == nil then error("Collision group is not registered: " .. groupName, 2) end
+            storedValues[ks] = groupName
+            storedValues["CollisionGroupId"] = collisionGroups[groupName]
+            setKeys["CollisionGroupId"] = true
+        end
+        if cls == "Attachment" and ks == "CFrame" and ctorOf(v) == "CFrame" then
+            local x, y, z = cfValues(v)
+            storedValues["Position"] = makeDataProxy("Vector3", {x, y, z}, name .. ".Position")
+            setKeys["Position"] = true
+        elseif cls == "Attachment" and ks == "Position" and ctorOf(v) == "Vector3" then
+            local a = vecArgs(v) or {}
+            local current = storedValues["CFrame"]
+            local _, _, _, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cfValues(current)
+            storedValues["CFrame"] = makeDataProxy("CFrame", {a[1] or 0, a[2] or 0, a[3] or 0, r00, r01, r02, r10, r11, r12, r20, r21, r22}, name .. ".CFrame")
+            setKeys["CFrame"] = true
+        end
+        if ks == "CFrame" and ctorOf(v) == "CFrame" then
+            local x, y, z = cfValues(v)
+            storedValues["Position"] = makeDataProxy("Vector3", {x, y, z}, name .. ".Position")
+            setKeys["Position"] = true
+        elseif ks == "Position" and ctorOf(v) == "Vector3" then
+            local a = vecArgs(v) or {}
+            local current = storedValues["CFrame"]
+            local _, _, _, r00, r01, r02, r10, r11, r12, r20, r21, r22 = cfValues(current)
+            storedValues["CFrame"] = makeDataProxy("CFrame", {a[1] or 0, a[2] or 0, a[3] or 0, r00, r01, r02, r10, r11, r12, r20, r21, r22}, name .. ".CFrame")
+            setKeys["CFrame"] = true
+        end
+        if isSpatialPartClass(cls) and (ks == "AssemblyLinearVelocity" or ks == "AssemblyAngularVelocity") and ctorOf(v) == "Vector3" then
+            local assembly = assemblyParts(t)
+            for i = 1, #assembly do
+                local part = assembly[i]
+                if not rawequal(part, t) then
+                    local pm = getmetatable(part)
+                    if pm and pm._storedValues then
+                        pm._storedValues[ks] = v
+                        pm._setKeys[ks] = true
+                    end
+                end
+            end
+        end
         -- NOTE: We deliberately do NOT change mt._name when the user sets the "Name" property.
         -- mt._name is the CODEGEN variable name (e.g. "inst1") used to refer to this proxy in
         -- the output. Renaming it to the Instance.Name value (e.g. "MyUI") would break
@@ -3617,17 +4404,6 @@ makeProxy = function(name: string): any
                 if awakePartsCount > 0 then
                     awakePartsCount -= 1
                 end
-            end
-        end
-        if ks == "AssemblyLinearVelocity" and isProxy(v) then
-            local velMt = getmetatable(v)
-            if velMt and velMt._ctorArgs then
-                local vx = velMt._ctorArgs[1] or 0
-                storedValues["Position"] = makeProxy(name .. ".Position")
-                local posMt = getmetatable(storedValues["Position"])
-                posMt._ctorArgs = { 0, -500, 0 }
-                posMt._ctorName = "Vector3"
-                storedValues["Parent"] = nil
             end
         end
         if ks == "VectorVelocity" and isProxy(v) and mt._className == "LinearVelocity" then
@@ -3727,34 +4503,6 @@ makeProxy = function(name: string): any
             error("attempt to call a Instance value", 2)
         end
 
-        local STATEMENT_METHODS = {
-            Connect = true, connect = true, ConnectParallel = true, Once = true, Disconnect = true,
-            Wait = true, wait = true, Destroy = true, Remove = true,
-            ClearAllChildren = true, DisconnectAll = true,
-            Init = true, Notify = true, Play = true, Pause = true, Cancel = true,
-            FireServer = true, FireClient = true, FireAllClients = true,
-            InvokeServer = true, InvokeClient = true,
-            Set = true, set = true, Add = true, Remove = true,
-            CaptureController = true, ClickButton1 = true, ClickButton2 = true,
-            GetChildren = true, GetDescendants = true, GetFullName = true,
-            IsA = true, Clone = true, IsDescendantOf = true,
-            GetAsync = true, PostAsync = true, RequestAsync = true,
-            HttpGet = true, HttpPost = true, HttpRequest = true,
-            JSONEncode = true, JSONDecode = true,
-            SetCore = true, GetCore = true,
-            FindFirstChild = true, WaitForChild = true,
-            FindFirstDescendant = true, FindFirstAncestor = true,
-            SetMetadata = true, GetMetadata = true,
-            SetItem = true, GetItem = true,
-            IsVibrationSupported = true, GetCorescriptLocalizations = true,
-            IsAvailable = true, HasAchieved = true,
-            GetRealPhysicsFPS = true, GetPhysicsFPS = true,
-            PreloadAsync = true, SendKeyEvent = true, GetDebugId = true,
-            Create = true, SendAsync = true,
-            ApplyAngularImpulse = true, ApplyImpulse = true, ApplyLinearImpulse = true,
-            GetPlayerFromCharacter = true, ReadVoxels = true,
-            SetSource = true, GetSource = true,
-        }
 
         local isMethod = false
         if parent and n >= 1 and rawequal(args[1], parent) then
@@ -3762,7 +4510,7 @@ makeProxy = function(name: string): any
             markUsed(parent)
             startIdx = 2
             isMethod = true
-        elseif parent and STATEMENT_METHODS[fieldName] then
+        elseif parent and PROXY_STATEMENT_METHODS[fieldName] then
             callExpr = proxyName(parent) .. ":" .. fieldName
             markUsed(parent)
             isMethod = true
@@ -3790,7 +4538,7 @@ makeProxy = function(name: string): any
         end
         usedVarNames[retName] = true
 
-        local isStatementCall = isMethod and STATEMENT_METHODS[fieldName] ~= nil
+        local isStatementCall = isMethod and PROXY_STATEMENT_METHODS[fieldName] ~= nil
 
         if isMethod and (fieldName == "GetService" or fieldName == "FindService" or fieldName == "findService") and parent and type(firstArg) == "string" then
             local parentName = proxyName(parent)
@@ -4177,6 +4925,15 @@ makeProxy = function(name: string): any
             end
             emit(string.format('%s:%s()', parentName, fieldName))
             destroyedInstances[parentName] = true
+            removeJoint(parent)
+            local parentBucket = partJoints[parent]
+            if parentBucket then
+                local pending = {}
+                for joint in pairs(parentBucket) do pending[#pending + 1] = joint end
+                for i = 1, #pending do removeJoint(pending[i]) end
+                partJoints[parent] = nil
+            end
+            spatialParts[parent] = nil
             local pm = getmetatable(parent)
             if pm and pm._storedValues then
                 pm._storedValues["Parent"] = nil
@@ -4386,21 +5143,49 @@ makeProxy = function(name: string): any
             return serde.encode("json", firstArg)
         end
 
-        if isMethod and (fieldName == "ApplyAngularImpulse" or fieldName == "ApplyImpulse" or fieldName == "ApplyLinearImpulse") and parent then
+        if isMethod and (fieldName == "ApplyAngularImpulse" or fieldName == "ApplyImpulse" or fieldName == "ApplyLinearImpulse" or fieldName == "ApplyImpulseAtPosition") and parent then
             local parentName = proxyName(parent)
             emit(string.format('%s:%s(%s)', parentName, fieldName, table.concat(parts, ", ")))
-            local parentMt = getmetatable(parent)
-            if parentMt and parentMt._storedValues then
-                local impulse = firstArg
-                if isProxy(impulse) then
-                    local impulseMt = getmetatable(impulse)
-                    local impulseArgs = rawget(impulse, "_ctorArgs") or impulseMt._ctorArgs or {0, 0, 0}
-                    if fieldName == "ApplyAngularImpulse" then
-                        parentMt._storedValues["AssemblyAngularVelocity"] = makeDataProxy("Vector3", impulseArgs, parentName .. ".AssemblyAngularVelocity")
-                        parentMt._setKeys["AssemblyAngularVelocity"] = true
-                    elseif fieldName == "ApplyLinearImpulse" or fieldName == "ApplyImpulse" then
-                        parentMt._storedValues["AssemblyLinearVelocity"] = makeDataProxy("Vector3", impulseArgs, parentName .. ".AssemblyLinearVelocity")
-                        parentMt._setKeys["AssemblyLinearVelocity"] = true
+            local impulse = firstArg
+            if ctorOf(impulse) ~= "Vector3" then return end
+            local ia = numericVec(impulse)
+            local mass, center = assemblyMassAndCenter(parent)
+            if mass <= 1e-9 then return end
+            local assembly = assemblyParts(parent)
+            if fieldName == "ApplyAngularImpulse" then
+                local size = numericVec(partSize(parent))
+                local inertia = mass * math.max(1e-6, size[1] * size[1] + size[2] * size[2] + size[3] * size[3]) / 12
+                for i = 1, #assembly do
+                    local part = assembly[i]
+                    local pm = getmetatable(part)
+                    local old = numericVec(storedOf(part, "AssemblyAngularVelocity"))
+                    pm._storedValues["AssemblyAngularVelocity"] = makeDataProxy("Vector3", {old[1] + ia[1] / inertia, old[2] + ia[2] / inertia, old[3] + ia[3] / inertia}, (pm._name or parentName) .. ".AssemblyAngularVelocity")
+                    pm._setKeys["AssemblyAngularVelocity"] = true
+                end
+                return
+            end
+            local delta = {ia[1] / mass, ia[2] / mass, ia[3] / mass}
+            for i = 1, #assembly do
+                local part = assembly[i]
+                local pm = getmetatable(part)
+                local old = numericVec(storedOf(part, "AssemblyLinearVelocity"))
+                pm._storedValues["AssemblyLinearVelocity"] = makeDataProxy("Vector3", {old[1] + delta[1], old[2] + delta[2], old[3] + delta[3]}, (pm._name or parentName) .. ".AssemblyLinearVelocity")
+                pm._setKeys["AssemblyLinearVelocity"] = true
+            end
+            if fieldName == "ApplyImpulseAtPosition" then
+                local position = args[startIdx + 1]
+                if ctorOf(position) == "Vector3" then
+                    local pa = numericVec(position)
+                    local r = {pa[1] - center[1], pa[2] - center[2], pa[3] - center[3]}
+                    local torque = crossVec(r, ia)
+                    local size = numericVec(partSize(parent))
+                    local inertia = mass * math.max(1e-6, size[1] * size[1] + size[2] * size[2] + size[3] * size[3]) / 12
+                    for i = 1, #assembly do
+                        local part = assembly[i]
+                        local pm = getmetatable(part)
+                        local old = numericVec(storedOf(part, "AssemblyAngularVelocity"))
+                        pm._storedValues["AssemblyAngularVelocity"] = makeDataProxy("Vector3", {old[1] + torque[1] / inertia, old[2] + torque[2] / inertia, old[3] + torque[3] / inertia}, (pm._name or parentName) .. ".AssemblyAngularVelocity")
+                        pm._setKeys["AssemblyAngularVelocity"] = true
                     end
                 end
             end
@@ -4957,10 +5742,330 @@ makeProxy = function(name: string): any
             return v
         end
 
+        if isMethod and fieldName == "ExpandToGrid" and parent and ctorOf(parent) == "Region3" then
+            local resolution = math.max(1e-6, tonumber(firstArg) or 4)
+            local minx, miny, minz, maxx, maxy, maxz = regionBounds(parent)
+            if not minx then return parent end
+            minx, miny, minz = math.floor(minx / resolution) * resolution, math.floor(miny / resolution) * resolution, math.floor(minz / resolution) * resolution
+            maxx, maxy, maxz = math.ceil(maxx / resolution) * resolution, math.ceil(maxy / resolution) * resolution, math.ceil(maxz / resolution) * resolution
+            emit(string.format('local %s = %s:ExpandToGrid(%s)', retName, proxyName(parent), serialize(resolution)))
+            local region = makeProxy(retName)
+            local rm = getmetatable(region)
+            rm._ctorName = "Region3"
+            rm._ctorArgs = {makeDataProxy("Vector3", {minx, miny, minz}, retName .. ".Min"), makeDataProxy("Vector3", {maxx, maxy, maxz}, retName .. ".Max")}
+            return region
+        end
+
+        if isMethod and (fieldName == "ClosestPoint" or fieldName == "Distance") and parent and ctorOf(parent) == "Ray" then
+            local point = firstArg
+            local rm = getmetatable(parent)
+            local ra = rm and rm._ctorArgs or {}
+            local origin, direction = ra[1], ra[2]
+            local oa, da, pa = numericVec(origin), numericVec(direction), numericVec(point)
+            local dd = dot3(da, da)
+            local t = 0
+            if dd > 1e-12 then t = math.max(0, ((pa[1] - oa[1]) * da[1] + (pa[2] - oa[2]) * da[2] + (pa[3] - oa[3]) * da[3]) / dd) end
+            local cp = {oa[1] + da[1] * t, oa[2] + da[2] * t, oa[3] + da[3] * t}
+            emit(string.format('local %s = %s:%s(%s)', retName, proxyName(parent), fieldName, serialize(point)))
+            if fieldName == "ClosestPoint" then return makeDataProxy("Vector3", cp, retName) end
+            local dx, dy, dz = pa[1] - cp[1], pa[2] - cp[2], pa[3] - cp[3]
+            return math.sqrt(dx * dx + dy * dy + dz * dz)
+        end
+
+        if isMethod and parent and (getmetatable(parent) and getmetatable(parent)._className) == "PhysicsService" then
+            local parentName = proxyName(parent)
+            if fieldName == "RegisterCollisionGroup" or fieldName == "CreateCollisionGroup" then
+                local groupName = tostring(firstArg or "")
+                emit(string.format('local %s = %s:%s(%s)', retName, parentName, fieldName, serialize(groupName)))
+                if groupName == "" then error("Collision group name cannot be empty", 0) end
+                if collisionGroups[groupName] ~= nil then return collisionGroups[groupName] end
+                local id = nextCollisionGroupId
+                nextCollisionGroupId += 1
+                collisionGroups[groupName] = id
+                collisionGroupNames[id] = groupName
+                return id
+            end
+            if fieldName == "UnregisterCollisionGroup" or fieldName == "RemoveCollisionGroup" then
+                local groupName = tostring(firstArg or "")
+                emit(string.format('%s:%s(%s)', parentName, fieldName, serialize(groupName)))
+                if groupName == "Default" then error("Cannot unregister Default collision group", 0) end
+                local id = collisionGroups[groupName]
+                if id ~= nil then
+                    collisionGroups[groupName] = nil
+                    collisionGroupNames[id] = nil
+                    local remove = {}
+                    for k in pairs(collisionPairs) do
+                        if k:find(groupName, 1, true) then remove[#remove + 1] = k end
+                    end
+                    for i = 1, #remove do collisionPairs[remove[i]] = nil end
+                end
+                return
+            end
+            if fieldName == "IsCollisionGroupRegistered" then
+                local groupName = tostring(firstArg or "")
+                emit(string.format('local %s = %s:IsCollisionGroupRegistered(%s)', retName, parentName, serialize(groupName)))
+                return collisionGroups[groupName] ~= nil
+            end
+            if fieldName == "CollisionGroupSetCollidable" then
+                local a, b, collidable = tostring(args[startIdx] or "Default"), tostring(args[startIdx + 1] or "Default"), args[startIdx + 2] ~= false
+                emit(string.format('%s:CollisionGroupSetCollidable(%s)', parentName, table.concat(parts, ", ")))
+                if collisionGroups[a] == nil or collisionGroups[b] == nil then error("Collision group is not registered", 0) end
+                collisionPairs[collisionPairKey(a, b)] = collidable
+                return
+            end
+            if fieldName == "CollisionGroupsAreCollidable" then
+                local a, b = tostring(args[startIdx] or "Default"), tostring(args[startIdx + 1] or "Default")
+                emit(string.format('local %s = %s:CollisionGroupsAreCollidable(%s)', retName, parentName, table.concat(parts, ", ")))
+                return groupsCollidable(a, b)
+            end
+            if fieldName == "GetCollisionGroupId" then
+                local groupName = tostring(firstArg or "Default")
+                emit(string.format('local %s = %s:GetCollisionGroupId(%s)', retName, parentName, serialize(groupName)))
+                local id = collisionGroups[groupName]
+                if id == nil then error("Collision group is not registered: " .. groupName, 0) end
+                return id
+            end
+            if fieldName == "GetCollisionGroupName" then
+                local id = tonumber(firstArg) or 0
+                emit(string.format('local %s = %s:GetCollisionGroupName(%s)', retName, parentName, serialize(id)))
+                local groupName = collisionGroupNames[id]
+                if not groupName then error("Collision group id is not registered", 0) end
+                return groupName
+            end
+            if fieldName == "GetRegisteredCollisionGroups" or fieldName == "GetCollisionGroups" then
+                emit(string.format('local %s = %s:%s()', retName, parentName, fieldName))
+                local result = {}
+                for groupName, id in pairs(collisionGroups) do
+                    result[#result + 1] = {name = groupName, Name = groupName, id = id, Id = id, mask = 0, Mask = 0}
+                end
+                table.sort(result, function(a, b) return a.id < b.id end)
+                return result
+            end
+            if fieldName == "RenameCollisionGroup" then
+                local oldName, newName = tostring(args[startIdx] or ""), tostring(args[startIdx + 1] or "")
+                emit(string.format('%s:RenameCollisionGroup(%s)', parentName, table.concat(parts, ", ")))
+                if oldName == "Default" or newName == "" or collisionGroups[newName] ~= nil then error("Invalid collision group rename", 0) end
+                local id = collisionGroups[oldName]
+                if id == nil then error("Collision group is not registered: " .. oldName, 0) end
+                collisionGroups[oldName] = nil
+                collisionGroups[newName] = id
+                collisionGroupNames[id] = newName
+                local updates = {}
+                for k, v in pairs(collisionPairs) do
+                    if k:find(oldName, 1, true) then updates[#updates + 1] = {k, v} end
+                end
+                for i = 1, #updates do
+                    local oldKey, value = updates[i][1], updates[i][2]
+                    collisionPairs[oldKey] = nil
+                    local sep = oldKey:find("\0", 1, true)
+                    local a, b = oldKey:sub(1, sep - 1), oldKey:sub(sep + 1)
+                    if a == oldName then a = newName end
+                    if b == oldName then b = newName end
+                    collisionPairs[collisionPairKey(a, b)] = value
+                end
+                for part in pairs(spatialParts) do
+                    if storedOf(part, "CollisionGroup") == oldName then
+                        local pm = getmetatable(part)
+                        pm._storedValues["CollisionGroup"] = newName
+                        pm._setKeys["CollisionGroup"] = true
+                    end
+                end
+                return
+            end
+            if fieldName == "SetPartCollisionGroup" then
+                local part, groupName = args[startIdx], tostring(args[startIdx + 1] or "Default")
+                emit(string.format('%s:SetPartCollisionGroup(%s)', parentName, table.concat(parts, ", ")))
+                if not isProxy(part) or collisionGroups[groupName] == nil then error("Invalid collision group assignment", 0) end
+                local pm = getmetatable(part)
+                pm._storedValues["CollisionGroup"] = groupName
+                pm._setKeys["CollisionGroup"] = true
+                return
+            end
+        end
+
+        if isMethod and parent and (getmetatable(parent) and getmetatable(parent)._className) == "Terrain" then
+            local parentName = proxyName(parent)
+            local ops, colors = terrainState(parent)
+            if fieldName == "Clear" then
+                emit(string.format('%s:Clear()', parentName))
+                table.clear(ops)
+                return
+            end
+            if fieldName == "FillBlock" then
+                local cf, size, material = args[startIdx], args[startIdx + 1], args[startIdx + 2]
+                emit(string.format('%s:FillBlock(%s)', parentName, table.concat(parts, ", ")))
+                if ctorOf(cf) == "CFrame" and ctorOf(size) == "Vector3" then ops[#ops + 1] = {kind = "block", cf = cf, size = size, material = material} end
+                return
+            end
+            if fieldName == "FillBall" then
+                local position, radius, material = args[startIdx], math.max(0, tonumber(args[startIdx + 1]) or 0), args[startIdx + 2]
+                emit(string.format('%s:FillBall(%s)', parentName, table.concat(parts, ", ")))
+                if ctorOf(position) == "Vector3" then ops[#ops + 1] = {kind = "ball", position = position, radius = radius, material = material} end
+                return
+            end
+            if fieldName == "FillRegion" then
+                local region, resolution, material = args[startIdx], tonumber(args[startIdx + 1]) or 4, args[startIdx + 2]
+                emit(string.format('%s:FillRegion(%s)', parentName, table.concat(parts, ", ")))
+                local minx, miny, minz, maxx, maxy, maxz = regionBounds(region)
+                if minx then ops[#ops + 1] = {kind = "region", minx = minx, miny = miny, minz = minz, maxx = maxx, maxy = maxy, maxz = maxz, resolution = resolution, material = material} end
+                return
+            end
+            if fieldName == "ReplaceMaterial" then
+                local region, resolution, fromMaterial, toMaterial = args[startIdx], tonumber(args[startIdx + 1]) or 4, args[startIdx + 2], args[startIdx + 3]
+                emit(string.format('%s:ReplaceMaterial(%s)', parentName, table.concat(parts, ", ")))
+                local minx, miny, minz, maxx, maxy, maxz = regionBounds(region)
+                if minx then ops[#ops + 1] = {kind = "replace", minx = minx, miny = miny, minz = minz, maxx = maxx, maxy = maxy, maxz = maxz, resolution = resolution, fromName = materialName(fromMaterial), toMaterial = toMaterial} end
+                return
+            end
+            if fieldName == "WriteVoxels" then
+                local region, resolution, materials, occupancy = args[startIdx], math.max(1e-6, tonumber(args[startIdx + 1]) or 4), args[startIdx + 2], args[startIdx + 3]
+                emit(string.format('%s:WriteVoxels(%s)', parentName, table.concat(parts, ", ")))
+                local minx, miny, minz = regionBounds(region)
+                if minx and type(materials) == "table" and type(occupancy) == "table" then
+                    ops[#ops + 1] = {kind = "cells", minx = minx, miny = miny, minz = minz, resolution = resolution, materials = materials, occupancy = occupancy}
+                end
+                return
+            end
+            if fieldName == "ReadVoxels" then
+                local region, resolution = args[startIdx], math.max(1e-6, tonumber(args[startIdx + 1]) or 4)
+                emit(string.format('local %s = %s:ReadVoxels(%s)', retName, parentName, table.concat(parts, ", ")))
+                local minx, miny, minz, maxx, maxy, maxz = regionBounds(region)
+                if not minx then return {}, {} end
+                local nx = math.max(1, math.ceil((maxx - minx) / resolution))
+                local ny = math.max(1, math.ceil((maxy - miny) / resolution))
+                local nz = math.max(1, math.ceil((maxz - minz) / resolution))
+                if nx * ny * nz > 262144 then error("ReadVoxels region is too large", 0) end
+                local materials, occupancy = {}, {}
+                for x = 1, nx do
+                    local mx, ox = {}, {}
+                    materials[x], occupancy[x] = mx, ox
+                    local wx = minx + (x - 0.5) * resolution
+                    for y = 1, ny do
+                        local my, oy = {}, {}
+                        mx[y], ox[y] = my, oy
+                        local wy = miny + (y - 0.5) * resolution
+                        for z = 1, nz do
+                            local wz = minz + (z - 0.5) * resolution
+                            local material, amount = terrainSample(parent, wx, wy, wz)
+                            my[z], oy[z] = material, amount
+                        end
+                    end
+                end
+                return materials, occupancy
+            end
+            if fieldName == "WorldToCell" or fieldName == "WorldToCellPreferSolid" or fieldName == "WorldToCellPreferEmpty" then
+                local position = firstArg
+                local a = numericVec(position)
+                emit(string.format('local %s = %s:%s(%s)', retName, parentName, fieldName, serialize(position)))
+                local cell = makeProxy(retName)
+                local cm = getmetatable(cell)
+                cm._ctorName = "Vector3int16"
+                cm._ctorArgs = {math.floor(a[1] / 4), math.floor(a[2] / 4), math.floor(a[3] / 4)}
+                return cell
+            end
+            if fieldName == "CellCenterToWorld" then
+                local x, y, z = tonumber(args[startIdx]) or 0, tonumber(args[startIdx + 1]) or 0, tonumber(args[startIdx + 2]) or 0
+                emit(string.format('local %s = %s:CellCenterToWorld(%s)', retName, parentName, table.concat(parts, ", ")))
+                return makeDataProxy("Vector3", {x * 4 + 2, y * 4 + 2, z * 4 + 2}, retName)
+            end
+            if fieldName == "SetMaterialColor" then
+                local material, color = args[startIdx], args[startIdx + 1]
+                emit(string.format('%s:SetMaterialColor(%s)', parentName, table.concat(parts, ", ")))
+                colors[materialName(material)] = color
+                return
+            end
+            if fieldName == "GetMaterialColor" then
+                local material = firstArg
+                emit(string.format('local %s = %s:GetMaterialColor(%s)', retName, parentName, serialize(material)))
+                local color = colors[materialName(material)]
+                if color then return color end
+                return makeDataProxy("Color3", {0.5, 0.5, 0.5}, retName)
+            end
+            if fieldName == "CountCells" then
+                emit(string.format('local %s = %s:CountCells()', retName, parentName))
+                return #ops
+            end
+        end
+
         if isMethod and fieldName == "Raycast" and parent then
             local parentName = proxyName(parent)
             emit(string.format('local %s = %s:Raycast(%s)', retName, parentName, table.concat(parts, ", ")))
-            return nil
+            local origin = args[startIdx]
+            local direction = args[startIdx + 1]
+            local params = args[startIdx + 2]
+            if ctorOf(origin) ~= "Vector3" or ctorOf(direction) ~= "Vector3" then return nil end
+            local bestPart, bestPos, bestNormal, bestDistance = nil, nil, nil, math.huge
+            local respect = false
+            if isProxy(params) then
+                local pm = getmetatable(params)
+                respect = pm and pm._storedValues and pm._storedValues["RespectCanCollide"] == true or false
+            end
+            eachSpatialCandidate(params, function(part)
+                if not respect or storedOf(part, "CanCollide") ~= false then
+                    local _, pos, normal, distance = rayObb(origin, direction, part)
+                    if distance and distance < bestDistance then bestPart, bestPos, bestNormal, bestDistance = part, pos, normal, distance end
+                end
+            end)
+            if not bestPart then return nil end
+            return makeSpatialHit(retName, bestPart, bestPos, bestNormal, bestDistance)
+        end
+
+        if isMethod and fieldName == "Spherecast" and parent then
+            local parentName = proxyName(parent)
+            emit(string.format('local %s = %s:Spherecast(%s)', retName, parentName, table.concat(parts, ", ")))
+            local origin = args[startIdx]
+            local radius = tonumber(args[startIdx + 1]) or 0
+            local direction = args[startIdx + 2]
+            local params = args[startIdx + 3]
+            if ctorOf(origin) ~= "Vector3" or ctorOf(direction) ~= "Vector3" then return nil end
+            radius = math.max(0, radius)
+            local bestPart, bestPos, bestNormal, bestDistance = nil, nil, nil, math.huge
+            eachSpatialCandidate(params, function(part)
+                local _, pos, normal, distance = rayObb(origin, direction, part, {radius, radius, radius})
+                if distance and distance < bestDistance then bestPart, bestPos, bestNormal, bestDistance = part, pos, normal, distance end
+            end)
+            if not bestPart then return nil end
+            return makeSpatialHit(retName, bestPart, bestPos, bestNormal, bestDistance)
+        end
+
+        if isMethod and fieldName == "Blockcast" and parent then
+            local parentName = proxyName(parent)
+            emit(string.format('local %s = %s:Blockcast(%s)', retName, parentName, table.concat(parts, ", ")))
+            local castCf = args[startIdx]
+            local castSize = args[startIdx + 1]
+            local direction = args[startIdx + 2]
+            local params = args[startIdx + 3]
+            if ctorOf(castCf) ~= "CFrame" or ctorOf(castSize) ~= "Vector3" or ctorOf(direction) ~= "Vector3" then return nil end
+            local origin = castCf.Position
+            local bestPart, bestPos, bestNormal, bestDistance = nil, nil, nil, math.huge
+            eachSpatialCandidate(params, function(part)
+                local inflate = castInflate(partFrame(part), castCf, castSize)
+                local _, pos, normal, distance = rayObb(origin, direction, part, inflate)
+                if distance and distance < bestDistance then bestPart, bestPos, bestNormal, bestDistance = part, pos, normal, distance end
+            end)
+            if not bestPart then return nil end
+            return makeSpatialHit(retName, bestPart, bestPos, bestNormal, bestDistance)
+        end
+
+        if isMethod and fieldName == "Shapecast" and parent then
+            local parentName = proxyName(parent)
+            emit(string.format('local %s = %s:Shapecast(%s)', retName, parentName, table.concat(parts, ", ")))
+            local shape = args[startIdx]
+            local direction = args[startIdx + 1]
+            local params = args[startIdx + 2]
+            if not isProxy(shape) or ctorOf(direction) ~= "Vector3" then return nil end
+            local castCf, castSize = partFrame(shape), partSize(shape)
+            local origin = castCf.Position
+            local bestPart, bestPos, bestNormal, bestDistance = nil, nil, nil, math.huge
+            eachSpatialCandidate(params, function(part)
+                if not rawequal(part, shape) then
+                    local inflate = castInflate(partFrame(part), castCf, castSize)
+                    local _, pos, normal, distance = rayObb(origin, direction, part, inflate)
+                    if distance and distance < bestDistance then bestPart, bestPos, bestNormal, bestDistance = part, pos, normal, distance end
+                end
+            end)
+            if not bestPart then return nil end
+            return makeSpatialHit(retName, bestPart, bestPos, bestNormal, bestDistance)
         end
 
         if isMethod and fieldName == "GetMouseLocation" and parent then
@@ -4984,20 +6089,155 @@ makeProxy = function(name: string): any
             return mouse
         end
 
-        if isMethod and fieldName == "ClosestPoint" and parent then
+        if isMethod and (fieldName == "ClosestPoint" or fieldName == "GetClosestPointOnSurface") and parent then
             local parentName = proxyName(parent)
-            emit(string.format('local %s = %s:ClosestPoint(%s)', retName, parentName, table.concat(parts, ", ")))
-            local v = makeProxy(retName)
-            local vMt = getmetatable(v)
-            vMt._ctorName = "Vector3"
-            vMt._ctorArgs = { 0, 0, 0 }
-            return v
+            emit(string.format('local %s = %s:%s(%s)', retName, parentName, fieldName, table.concat(parts, ", ")))
+            local position = args[startIdx]
+            if ctorOf(position) == "Vector3" and isSpatialPartClass((getmetatable(parent) and getmetatable(parent)._className) or "") then
+                local v = closestPointOnPart(parent, position)
+                rawset(v, "_name", retName)
+                return v
+            end
+            return makeDataProxy("Vector3", {0, 0, 0}, retName)
         end
 
         if isMethod and (fieldName == "GetPartsInPart" or fieldName == "GetPartsInBox" or fieldName == "GetPartBoundsInBox" or fieldName == "GetPartBoundsInRadius") and parent then
             local parentName = proxyName(parent)
             emit(string.format('local %s = %s:%s(%s)', retName, parentName, fieldName, table.concat(parts, ", ")))
-            return {}
+            local result = {}
+            if fieldName == "GetPartsInPart" then
+                local queryPart = args[startIdx]
+                local params = args[startIdx + 1]
+                if not isProxy(queryPart) then return result end
+                local qcf, qsize = partFrame(queryPart), partSize(queryPart)
+                eachSpatialCandidate(params, function(part)
+                    if not rawequal(part, queryPart) and obbIntersects(qcf, qsize, partFrame(part), partSize(part)) then result[#result + 1] = part end
+                end)
+                return result
+            end
+            if fieldName == "GetPartsInBox" or fieldName == "GetPartBoundsInBox" then
+                local qcf = args[startIdx]
+                local qsize = args[startIdx + 1]
+                local params = args[startIdx + 2]
+                if ctorOf(qcf) ~= "CFrame" or ctorOf(qsize) ~= "Vector3" then return result end
+                eachSpatialCandidate(params, function(part)
+                    if obbIntersects(qcf, qsize, partFrame(part), partSize(part)) then result[#result + 1] = part end
+                end)
+                return result
+            end
+            local position = args[startIdx]
+            local radius = tonumber(args[startIdx + 1]) or 0
+            local params = args[startIdx + 2]
+            if ctorOf(position) ~= "Vector3" then return result end
+            eachSpatialCandidate(params, function(part)
+                if sphereIntersectsPart(position, math.max(0, radius), part) then result[#result + 1] = part end
+            end)
+            return result
+        end
+
+        if isMethod and fieldName == "GetTouchingParts" and parent then
+            local parentName = proxyName(parent)
+            emit(string.format('local %s = %s:GetTouchingParts()', retName, parentName))
+            local result = {}
+            local pm = getmetatable(parent)
+            if pm and isSpatialPartClass(pm._className or "") then
+                local pcf, psz = partFrame(parent), partSize(parent)
+                for part in pairs(spatialParts) do
+                    if isProxy(part) and not rawequal(part, parent) then
+                        local m = getmetatable(part)
+                        if m and m._storedValues and m._storedValues["Parent"] ~= nil and not destroyedInstances[m._name or ""] and obbIntersects(pcf, psz, partFrame(part), partSize(part)) then
+                            table.insert(result, part)
+                        end
+                    end
+                end
+            end
+            return result
+        end
+
+        if isMethod and fieldName == "CanCollideWith" and parent then
+            local parentName = proxyName(parent)
+            emit(string.format('local %s = %s:CanCollideWith(%s)', retName, parentName, table.concat(parts, ", ")))
+            local other = args[startIdx]
+            if not isProxy(other) then return false end
+            local a, b = storedOf(parent, "CollisionGroup") or "Default", storedOf(other, "CollisionGroup") or "Default"
+            return storedOf(parent, "CanCollide") ~= false and storedOf(other, "CanCollide") ~= false and groupsCollidable(a, b)
+        end
+
+        if isMethod and fieldName == "GetMass" and parent then
+            local parentName = proxyName(parent)
+            emit(string.format('local %s = %s:GetMass()', retName, parentName))
+            return massOfPart(parent)
+        end
+
+        if isMethod and fieldName == "GetVelocityAtPosition" and parent then
+            local parentName = proxyName(parent)
+            emit(string.format('local %s = %s:GetVelocityAtPosition(%s)', retName, parentName, table.concat(parts, ", ")))
+            local point = args[startIdx]
+            local linear = storedOf(parent, "AssemblyLinearVelocity")
+            local angular = storedOf(parent, "AssemblyAngularVelocity")
+            local la, aa = numericVec(linear), numericVec(angular)
+            local center = numericVec(partFrame(parent).Position)
+            local pa = numericVec(point)
+            local r = {pa[1] - center[1], pa[2] - center[2], pa[3] - center[3]}
+            local tangential = crossVec(aa, r)
+            return makeDataProxy("Vector3", {la[1] + tangential[1], la[2] + tangential[2], la[3] + tangential[3]}, retName)
+        end
+
+        if isMethod and fieldName == "GetRootPart" and parent then
+            local parentName = proxyName(parent)
+            emit(string.format('local %s = %s:GetRootPart()', retName, parentName))
+            return assemblyRoot(parent)
+        end
+
+        if isMethod and fieldName == "IsGrounded" and parent then
+            local parentName = proxyName(parent)
+            emit(string.format('local %s = %s:IsGrounded()', retName, parentName))
+            local cf, size = partFrame(parent), numericVec(partSize(parent))
+            local up = cf.UpVector
+            local start = cf.Position - up * (math.abs(size[2]) * 0.5 - 0.001)
+            local direction = -up * 0.05
+            local grounded = false
+            eachSpatialCandidate(nil, function(part)
+                if not rawequal(part, parent) then
+                    local _, _, _, distance = rayObb(start, direction, part)
+                    if distance then grounded = true; return false end
+                end
+            end)
+            return grounded
+        end
+
+        if isMethod and fieldName == "GetConnectedParts" and parent then
+            local parentName = proxyName(parent)
+            emit(string.format('local %s = %s:GetConnectedParts(%s)', retName, parentName, table.concat(parts, ", ")))
+            return connectedParts(parent, args[startIdx] == true)
+        end
+
+        if isMethod and fieldName == "GetJoints" and parent then
+            local parentName = proxyName(parent)
+            emit(string.format('local %s = %s:GetJoints()', retName, parentName))
+            return jointsForPart(parent)
+        end
+
+        if isMethod and fieldName == "GetNetworkOwner" and parent then
+            local parentName = proxyName(parent)
+            emit(string.format('local %s = %s:GetNetworkOwner()', retName, parentName))
+            return nil
+        end
+
+        if isMethod and fieldName == "CanSetNetworkOwnership" and parent then
+            local parentName = proxyName(parent)
+            emit(string.format('local %s = %s:CanSetNetworkOwnership()', retName, parentName))
+            return true, ""
+        end
+
+        if isMethod and (fieldName == "SetNetworkOwner" or fieldName == "SetNetworkOwnershipAuto" or fieldName == "BreakJoints" or fieldName == "MakeJoints") and parent then
+            local parentName = proxyName(parent)
+            emit(string.format('%s:%s(%s)', parentName, fieldName, table.concat(parts, ", ")))
+            if fieldName == "BreakJoints" then
+                local joints = jointsForPart(parent)
+                for i = 1, #joints do removeJoint(joints[i]) end
+            end
+            return
         end
 
         if isMethod and fieldName == "IsA" and parent then
@@ -5452,8 +6692,9 @@ spyInstance = function(className: string, name: string?, silent: boolean?): any
     mt._storedValues["Name"] = className
     mt._setKeys["Name"] = true
     mt._silent = silent == true
-    mt._declared = silent ~= true  -- non-silent proxies are already declared above
+    mt._declared = silent ~= true
     applyClassDefaults(proxy, className)
+    if isSpatialPartClass(className) then spatialParts[proxy] = true end
     return proxy
 end
 
@@ -6335,6 +7576,7 @@ local function createEnv()
     bpMt._setKeys["Parent"] = true
     if not parentChildMap["workspace"] then parentChildMap["workspace"] = {} end
     parentChildMap["workspace"]["Baseplate"] = baseplate
+    spatialParts[baseplate] = true
     local terrain = makeProxy("Terrain")
     local terrainMt = getmetatable(terrain)
     terrainMt._className = "Terrain"
@@ -6364,6 +7606,7 @@ local function createEnv()
             mt._storedValues["Name"] = cls
             mt._setKeys["Name"] = true
             applyClassDefaults(proxy, cls)
+            if isSpatialPartClass(cls) then spatialParts[proxy] = true end
             return proxy
         end,
     }, { __index = function(_, k) return makeProxy("Instance." .. tostring(k)) end })
@@ -6510,6 +7753,38 @@ local function createEnv()
     end
     env.Vector3 = newCtor("Vector3")
     env.Vector2 = newCtor("Vector2")
+    local function normalize3(x, y, z)
+        local m = math.sqrt(x * x + y * y + z * z)
+        if m == 0 then return 0, 0, 0 end
+        return x / m, y / m, z / m
+    end
+    local function cross3(ax, ay, az, bx, by, bz)
+        return ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx
+    end
+    local function cframeFromLook(pos, target, up)
+        local pa, ta = vecArgs(pos) or {}, vecArgs(target) or {}
+        local ua = vecArgs(up) or {0, 1, 0}
+        local px, py, pz = pa[1] or 0, pa[2] or 0, pa[3] or 0
+        local lx, ly, lz = normalize3((ta[1] or 0) - px, (ta[2] or 0) - py, (ta[3] or 0) - pz)
+        if lx == 0 and ly == 0 and lz == 0 then lx, ly, lz = 0, 0, -1 end
+        local rx, ry, rz = cross3(lx, ly, lz, ua[1] or 0, ua[2] or 1, ua[3] or 0)
+        rx, ry, rz = normalize3(rx, ry, rz)
+        if rx == 0 and ry == 0 and rz == 0 then rx, ry, rz = 1, 0, 0 end
+        local ux, uy, uz = cross3(rx, ry, rz, lx, ly, lz)
+        ux, uy, uz = normalize3(ux, uy, uz)
+        return {px, py, pz, rx, ux, -lx, ry, uy, -ly, rz, uz, -lz}
+    end
+    local function cframeAnglesXYZ(rx, ry, rz)
+        local sx, cx = math.sin(rx or 0), math.cos(rx or 0)
+        local sy, cy = math.sin(ry or 0), math.cos(ry or 0)
+        local sz, cz = math.sin(rz or 0), math.cos(rz or 0)
+        return {
+            0, 0, 0,
+            cy * cz, -cy * sz, sy,
+            cx * sz + sx * sy * cz, cx * cz - sx * sy * sz, -sx * cy,
+            sx * sz - cx * sy * cz, sx * cz + cx * sy * sz, cx * cy,
+        }
+    end
     env.CFrame = setmetatable({
         new = function(...)
             local v = genVar("cframe")
@@ -6517,40 +7792,80 @@ local function createEnv()
             local parts = {}
             for i = 1, select("#", ...) do table.insert(parts, serialize(args[i])) end
             emit(string.format('local %s = CFrame.new(%s)', v, table.concat(parts, ", ")))
-            return makeDataProxy("CFrame", {...}, v)
+            if #args == 0 then return makeDataProxy("CFrame", {0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1}, v) end
+            if #args == 1 and ctorOf(args[1]) == "Vector3" then
+                local a = vecArgs(args[1]) or {}
+                return makeDataProxy("CFrame", {a[1] or 0, a[2] or 0, a[3] or 0, 1, 0, 0, 0, 1, 0, 0, 0, 1}, v)
+            end
+            if #args == 2 and ctorOf(args[1]) == "Vector3" and ctorOf(args[2]) == "Vector3" then
+                return makeDataProxy("CFrame", cframeFromLook(args[1], args[2]), v)
+            end
+            if #args >= 12 then
+                return makeDataProxy("CFrame", {args[1] or 0, args[2] or 0, args[3] or 0, args[4] or 1, args[5] or 0, args[6] or 0, args[7] or 0, args[8] or 1, args[9] or 0, args[10] or 0, args[11] or 0, args[12] or 1}, v)
+            end
+            return makeDataProxy("CFrame", {args[1] or 0, args[2] or 0, args[3] or 0, 1, 0, 0, 0, 1, 0, 0, 0, 1}, v)
         end,
         Angles = function(rx, ry, rz)
             local v = genVar("cframe")
             emit(string.format('local %s = CFrame.Angles(%s, %s, %s)', v, serialize(rx), serialize(ry), serialize(rz)))
-            return makeDataProxy("CFrame", {0, 0, 0}, v)
+            return makeDataProxy("CFrame", cframeAnglesXYZ(rx, ry, rz), v)
         end,
         fromMatrix = function(pos, rvec, uvec, bvec)
             local v = genVar("cframe")
             local parts = {}
-            for _, a in ipairs({pos, rvec, uvec, bvec}) do
-                if a then table.insert(parts, serialize(a)) end
-            end
+            for _, a in ipairs({pos, rvec, uvec, bvec}) do if a then table.insert(parts, serialize(a)) end end
             emit(string.format('local %s = CFrame.fromMatrix(%s)', v, table.concat(parts, ", ")))
-            return makeDataProxy("CFrame", {0, 0, 0}, v)
+            local pa, ra, ua, ba = vecArgs(pos) or {}, vecArgs(rvec) or {}, vecArgs(uvec) or {}, vecArgs(bvec) or nil
+            local rx, ry, rz = ra[1] or 1, ra[2] or 0, ra[3] or 0
+            local ux, uy, uz = ua[1] or 0, ua[2] or 1, ua[3] or 0
+            local bx, by, bz
+            if ba then
+                bx, by, bz = ba[1] or 0, ba[2] or 0, ba[3] or 1
+            else
+                bx, by, bz = cross3(rx, ry, rz, ux, uy, uz)
+            end
+            return makeDataProxy("CFrame", {pa[1] or 0, pa[2] or 0, pa[3] or 0, rx, ux, bx, ry, uy, by, rz, uz, bz}, v)
         end,
         fromEulerAnglesXYZ = function(rx, ry, rz)
             local v = genVar("cframe")
             emit(string.format('local %s = CFrame.fromEulerAnglesXYZ(%s, %s, %s)', v, serialize(rx), serialize(ry), serialize(rz)))
-            return makeDataProxy("CFrame", {0, 0, 0}, v)
+            return makeDataProxy("CFrame", cframeAnglesXYZ(rx, ry, rz), v)
+        end,
+        fromEulerAnglesYXZ = function(rx, ry, rz)
+            local v = genVar("cframe")
+            emit(string.format('local %s = CFrame.fromEulerAnglesYXZ(%s, %s, %s)', v, serialize(rx), serialize(ry), serialize(rz)))
+            local y = cframeAnglesXYZ(0, ry or 0, 0)
+            local x = cframeAnglesXYZ(rx or 0, 0, 0)
+            local z = cframeAnglesXYZ(0, 0, rz or 0)
+            local yp = makeDataProxy("CFrame", y, v .. "y")
+            local xp = makeDataProxy("CFrame", x, v .. "x")
+            local zp = makeDataProxy("CFrame", z, v .. "z")
+            local yx = makeDataProxy("CFrame", cfMulArgs(yp, xp), v .. "yx")
+            return makeDataProxy("CFrame", cfMulArgs(yx, zp), v)
         end,
         fromAxisAngle = function(v3, angle)
             local v = genVar("cframe")
             emit(string.format('local %s = CFrame.fromAxisAngle(%s, %s)', v, serialize(v3), serialize(angle)))
-            return makeDataProxy("CFrame", {0, 0, 0}, v)
+            local a = vecArgs(v3) or {}
+            local x, y, z = normalize3(a[1] or 0, a[2] or 0, a[3] or 0)
+            local c, si, t = math.cos(angle or 0), math.sin(angle or 0), 1 - math.cos(angle or 0)
+            return makeDataProxy("CFrame", {0, 0, 0, t*x*x+c, t*x*y-si*z, t*x*z+si*y, t*x*y+si*z, t*y*y+c, t*y*z-si*x, t*x*z-si*y, t*y*z+si*x, t*z*z+c}, v)
+        end,
+        lookAt = function(at, lookAt, up)
+            local v = genVar("cframe")
+            emit(string.format('local %s = CFrame.lookAt(%s, %s, %s)', v, serialize(at), serialize(lookAt), serialize(up)))
+            return makeDataProxy("CFrame", cframeFromLook(at, lookAt, up), v)
+        end,
+        lookAlong = function(at, direction, up)
+            local v = genVar("cframe")
+            local pa, da = vecArgs(at) or {}, vecArgs(direction) or {}
+            local target = makeDataProxy("Vector3", {(pa[1] or 0) + (da[1] or 0), (pa[2] or 0) + (da[2] or 0), (pa[3] or 0) + (da[3] or 0)}, v .. "target")
+            emit(string.format('local %s = CFrame.lookAlong(%s, %s, %s)', v, serialize(at), serialize(direction), serialize(up)))
+            return makeDataProxy("CFrame", cframeFromLook(at, target, up), v)
         end,
     }, {
         __index = function(_, k)
-            local constants = {
-                identity = {0, 0, 0},
-            }
-            if constants[k] then
-                return makeDataProxy("CFrame", constants[k], "CFrame." .. k)
-            end
+            if k == "identity" then return makeDataProxy("CFrame", {0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1}, "CFrame.identity") end
             return makeProxy("CFrame." .. tostring(k))
         end,
     })
@@ -6745,10 +8060,73 @@ local function createEnv()
     env.NumberSequenceKeypoint = newCtor("NumberSequenceKeypoint")
     env.ColorSequence = newCtor("ColorSequence")
     env.ColorSequenceKeypoint = newCtor("ColorSequenceKeypoint")
-    env.PhysicalProperties = newCtor("PhysicalProperties")
+    local materialPhysicsDefaults = {
+        Plastic = {0.7, 0.3, 0.5, 100, 100}, SmoothPlastic = {0.7, 0.2, 0.5, 100, 100},
+        Concrete = {2.4, 0.7, 0.2, 100, 100}, Brick = {1.8, 0.8, 0.15, 100, 100},
+        Wood = {0.35, 0.48, 0.2, 100, 100}, WoodPlanks = {0.35, 0.48, 0.2, 100, 100},
+        Metal = {7.85, 0.4, 0.25, 100, 100}, DiamondPlate = {7.85, 0.35, 0.25, 100, 100},
+        Glass = {2.4, 0.25, 0.2, 100, 100}, Ice = {0.919, 0.02, 0.15, 100, 100},
+        Grass = {0.9, 0.8, 0.1, 100, 100}, Sand = {1.6, 0.5, 0.05, 100, 100},
+        Fabric = {0.7, 0.35, 0.05, 100, 100}, Slate = {2.7, 0.4, 0.2, 100, 100},
+    }
+    env.PhysicalProperties = setmetatable({
+        new = function(...)
+            local args = {...}
+            local values
+            if #args == 1 and isProxy(args[1]) then
+                values = materialPhysicsDefaults[materialName(args[1])] or materialPhysicsDefaults.Plastic
+            else
+                values = {
+                    math.max(0.01, tonumber(args[1]) or 0.7),
+                    math.max(0, math.min(1, tonumber(args[2]) or 0.3)),
+                    math.max(0, math.min(1, tonumber(args[3]) or 0.5)),
+                    math.max(0, math.min(100, tonumber(args[4]) or 100)),
+                    math.max(0, math.min(100, tonumber(args[5]) or 100)),
+                }
+            end
+            local v = genVar("physicalproperties")
+            local repr = {}
+            for i = 1, #args do repr[i] = serialize(args[i]) end
+            emit(string.format('local %s = PhysicalProperties.new(%s)', v, table.concat(repr, ", ")))
+            local proxy = makeProxy(v)
+            local mt = getmetatable(proxy)
+            mt._ctorName = "PhysicalProperties"
+            mt._ctorArgs = {values[1], values[2], values[3], values[4], values[5]}
+            return proxy
+        end,
+    }, { __index = function(_, k) return makeProxy("PhysicalProperties." .. tostring(k)) end })
     env.TweenInfo = newCtor("TweenInfo")
-    env.RaycastParams = newCtor("RaycastParams")
-    env.OverlapParams = newCtor("OverlapParams")
+    local function paramsCtor(name)
+        return setmetatable({
+            new = function()
+                local v = genVar(name:lower())
+                emit(string.format('local %s = %s.new()', v, name))
+                local proxy = makeProxy(v)
+                local mt = getmetatable(proxy)
+                mt._ctorName = name
+                mt._storedValues["FilterDescendantsInstances"] = {}
+                mt._setKeys["FilterDescendantsInstances"] = true
+                mt._storedValues["FilterType"] = env.Enum.RaycastFilterType.Exclude
+                mt._setKeys["FilterType"] = true
+                mt._storedValues["CollisionGroup"] = "Default"
+                mt._setKeys["CollisionGroup"] = true
+                mt._storedValues["RespectCanCollide"] = false
+                mt._setKeys["RespectCanCollide"] = true
+                mt._storedValues["BruteForceAllSlow"] = false
+                mt._setKeys["BruteForceAllSlow"] = true
+                if name == "RaycastParams" then
+                    mt._storedValues["IgnoreWater"] = false
+                    mt._setKeys["IgnoreWater"] = true
+                else
+                    mt._storedValues["MaxParts"] = 0
+                    mt._setKeys["MaxParts"] = true
+                end
+                return proxy
+            end,
+        }, { __index = function(_, k) return makeProxy(name .. "." .. tostring(k)) end })
+    end
+    env.RaycastParams = paramsCtor("RaycastParams")
+    env.OverlapParams = paramsCtor("OverlapParams")
     env.PathWaypoint = newCtor("PathWaypoint")
     env.Font = setmetatable({}, { __index = function(_, k) return makeProxy("Font." .. tostring(k)) end })
     env.buffer = setmetatable({
@@ -8787,65 +10165,40 @@ local function isGenericVar(name: string): boolean
 end
 
 -- Count actual usages of a variable name across all lines (robust, grep-based)
-local function countVarUsages(varName: string): number
-    local count = 0
-    -- %f is frontier; we look for the varName as a whole word
-    local pattern = "%f[%w_]" .. varName .. "%f[^%w_]"
-    for _, line in ipairs(lines) do
-        local n = 0
-        local s = line
-        -- count non-overlapping matches
-        local start = 1
-        while true do
-            local i, j = string.find(s, pattern, start)
-            if not i then break end
-            n += 1
-            start = j + 1
-        end
-        -- subtract 1 if this line is the declaration (we don't want to count the LHS of `local X = ...`)
-        local declLHS = string.match(line, "^local " .. varName .. " =")
-        if declLHS then
-            n = n - 1
-        end
-        count += n
-    end
-    return count
-end
-
 local function deadCodeElimination()
-    local result = {}
-    for _, line in ipairs(lines) do
+    local useCount = {}
+    local declared = {}
+    for i = 1, #lines do
+        local line = lines[i]
         local v = string.match(line, "^local ([%a_][%w_]*%d+) = (.+)$")
-        if v and isGenericVar(v) then
-            -- Use robust grep-based usage count (the old usedVars map was incomplete)
-            local uses = countVarUsages(v)
-            if uses == 0 then
-                -- Variable is declared but never referenced.
-                -- If the expression has side effects (Instance.new, Connect, etc.), keep it.
-                -- Otherwise drop it.
-                local expr = string.match(line, "^local [%a_][%w_]*%d+ = (.+)$")
-                if expr then
-                    local hasSideEffect = expr:match("^Instance%.new")
-                        or expr:match("^Color3%.")
-                        or expr:match("^Vector3%.")
-                        or expr:match("^UDim2%.")
-                        or expr:match("^CFrame%.")
-                        or expr:match(":Connect%(")
-                        or expr:match(":GetService%(")
-                        or expr:match("WaitForChild%(")
-                        or expr:match("^game%.")
-                        or expr:match("^workspace%.")
-                    if hasSideEffect then
-                        table.insert(result, line)
-                    else
-                        -- drop the unused var
-                    end
-                end
-            else
-                table.insert(result, line)
-            end
-        else
-            table.insert(result, line)
+        if v and isGenericVar(v) then declared[v] = true end
+        for name in string.gmatch(line, "[%a_][%w_]*%d+") do
+            if isGenericVar(name) then useCount[name] = (useCount[name] or 0) + 1 end
+        end
+        if v and isGenericVar(v) then useCount[v] = (useCount[v] or 1) - 1 end
+    end
+    local result = {}
+    local n = 0
+    for i = 1, #lines do
+        local line = lines[i]
+        local v, expr = string.match(line, "^local ([%a_][%w_]*%d+) = (.+)$")
+        local keep = true
+        if v and declared[v] and (useCount[v] or 0) == 0 then
+            local hasSideEffect = expr:match("^Instance%.new")
+                or expr:match("^Color3%.")
+                or expr:match("^Vector3%.")
+                or expr:match("^UDim2%.")
+                or expr:match("^CFrame%.")
+                or expr:match(":Connect%(")
+                or expr:match(":GetService%(")
+                or expr:match("WaitForChild%(")
+                or expr:match("^game%.")
+                or expr:match("^workspace%.")
+            keep = hasSideEffect ~= nil
+        end
+        if keep then
+            n += 1
+            result[n] = line
         end
     end
     lines = result
@@ -8853,51 +10206,57 @@ end
 
 local function inlineVars()
     if not Settings.inline then return end
-    local maxIter = 100
-    while maxIter > 0 do
-        maxIter -= 1
-
-        local useCount = {}
-        local defIdx = {}
-        local defExpr = {}
-        for i, line in ipairs(lines) do
-            local v, expr = string.match(line, "^local ([%a_][%w_]*%d+) = (.+)$")
-            if v and isGenericVar(v) then
-                defIdx[v] = i
-                defExpr[v] = expr
-            end
-            for var in string.gmatch(line, "[%a_][%w_]*%d+") do
-                if var ~= v then
-                    useCount[var] = (useCount[var] or 0) + 1
-                end
+    local useCount = {}
+    local useLine = {}
+    local defIdx = {}
+    local defExpr = {}
+    local defAtLine = {}
+    for i = 1, #lines do
+        local line = lines[i]
+        local v, expr = string.match(line, "^local ([%a_][%w_]*%d+) = (.+)$")
+        if v and isGenericVar(v) then
+            defIdx[v] = i
+            defExpr[v] = expr
+            defAtLine[i] = v
+        end
+        for name in string.gmatch(line, "[%a_][%w_]*%d+") do
+            if name ~= v and isGenericVar(name) then
+                useCount[name] = (useCount[name] or 0) + 1
+                useLine[name] = i
             end
         end
-
-        local bestVar = nil
-        local bestIdx = 0
-        for v, idx in pairs(defIdx) do
-            if (useCount[v] or 0) == 1 and idx > bestIdx then
-                local expr = defExpr[v]
-                if #expr < 200 and not expr:match("^function") and not expr:match("^%{") then
-                    bestVar = v
-                    bestIdx = idx
-                end
-            end
-        end
-
-        if not bestVar then break end
-
-        local expr = defExpr[bestVar]
-        local pattern = "%f[%w_]" .. bestVar .. "%f[^%w_]"
-        local newLines = {}
-        for i, line in ipairs(lines) do
-            if i == bestIdx then
-            else
-                table.insert(newLines, (string.gsub(line, pattern, expr)))
-            end
-        end
-        lines = newLines
     end
+    local replacements = {}
+    local remove = {}
+    for v, idx in pairs(defIdx) do
+        local target = useLine[v]
+        local expr = defExpr[v]
+        if (useCount[v] or 0) == 1 and target and target > idx and not defAtLine[target]
+            and #expr < 200 and not expr:match("^function") and not expr:match("^%{") then
+            local bucket = replacements[target]
+            if not bucket then bucket = {}; replacements[target] = bucket end
+            bucket[#bucket + 1] = {v, expr}
+            remove[idx] = true
+        end
+    end
+    if next(replacements) == nil then return end
+    local result = {}
+    local n = 0
+    for i = 1, #lines do
+        if not remove[i] then
+            local line = lines[i]
+            local bucket = replacements[i]
+            if bucket then
+                for j = 1, #bucket do
+                    local item = bucket[j]
+                    line = string.gsub(line, "%f[%w_]" .. item[1] .. "%f[^%w_]", item[2])
+                end
+            end
+            n += 1
+            result[n] = line
+        end
+    end
+    lines = result
 end
 
 local function beautify()
@@ -9232,13 +10591,19 @@ end
 local function customBeautify(source: string): string
     if not Settings.beautify then return source end
     local output: { string } = {}
+    local n = 0
     for line in iterLines(source) do
         if line == "" then
-            table.insert(output, "")
+            n += 1
+            output[n] = ""
+        elseif not line:find("{", 1, true) and not line:find("function", 1, true) then
+            n += 1
+            output[n] = line
         else
             local beautified = beautifyLine(line)
-            for _, l in ipairs(beautified) do
-                table.insert(output, l)
+            for i = 1, #beautified do
+                n += 1
+                output[n] = beautified[i]
             end
         end
     end
@@ -9267,6 +10632,10 @@ local function dump(source: string): string
     lines = {}
     varCount = 0
     usedVars = {}
+    opCount = 0
+    lastFlushCount = 0
+    nextFlushCount = PARTIAL_FLUSH_INTERVAL
+    lastEmitted = nil
     for k in pairs(propertyChangeCallbacks) do propertyChangeCallbacks[k] = nil end
     for i = #eventConnections, 1, -1 do eventConnections[i] = nil end
     for k in pairs(instanceTags) do instanceTags[k] = nil end
@@ -9276,6 +10645,7 @@ local function dump(source: string): string
     for k in pairs(parentChildMap) do parentChildMap[k] = nil end
     awakePartsCount = 0
     for k in pairs(unanchoredParts) do unanchoredParts[k] = nil end
+    for k in pairs(spatialParts) do spatialParts[k] = nil end
     for k in pairs(frozenTables) do frozenTables[k] = nil end
     for k in pairs(readonlyTables) do readonlyTables[k] = nil end
     for k in pairs(functionAddrMap) do functionAddrMap[k] = nil end
@@ -9309,7 +10679,9 @@ local function dump(source: string): string
     end)
     
     local loadOk, loadErr = pcall(function()
-        local compiled = luau.compile(SANDBOX_PRELUDE .. processedSource, { optimizationLevel = 2 })
+        local sourceSize = #processedSource
+        local optimizationLevel = sourceSize >= 262144 and 1 or 2
+        local compiled = luau.compile(SANDBOX_PRELUDE .. processedSource, { optimizationLevel = optimizationLevel, debugLevel = 1 })
         fn = luau.load(compiled, { debugName = "envlog", environment = env })
     end)
     if not loadOk or not fn then
@@ -9320,20 +10692,8 @@ local function dump(source: string): string
     local INSN_BUDGET = 100000000
     local insnCount = 0
     local timedOut = false
-    local wallLimit = tonumber(Settings.timeout) or 60
+    local wallLimit = tonumber(Settings.timeout) or 45
     local wallStart = os.clock()
-
-    -- Spawn a watchdog coroutine that kills the execution after wallLimit
-    local watchdogFired = false
-    local watchdog = task.delay(wallLimit, function()
-        watchdogFired = true
-        -- Force error to break out of pcall
-        pcall(function()
-            error("WALL_CLOCK_TIMEOUT", 0)
-        end)
-    end)
-
-    -- Override tick/wait inside env to check wall time
     local realOsClock = os.clock
     local _envRef = _G._envRef
     if _envRef then
@@ -9371,7 +10731,6 @@ local function dump(source: string): string
         return e
     end
     local ok, err = xpcall(fn, _errHandler)
-    task.cancel(watchdog)
     if not ok then
         local errStr = _caughtErr or tostring(err)
         if errStr:find("WALL_CLOCK_TIMEOUT", 1, true) then
@@ -9390,13 +10749,24 @@ local function dump(source: string): string
         end
     end
 
-    inlineVars()
-    deadCodeElimination()
+    if Settings.final_partial == true then flushPartial() end
+    local lineCount = #lines
+    if lineCount <= (tonumber(Settings.inline_line_limit) or 50000) then
+        inlineVars()
+        lineCount = #lines
+    end
+    if lineCount <= (tonumber(Settings.dce_line_limit) or 90000) then
+        deadCodeElimination()
+    end
     beautify()
     local raw = table.concat(lines, "\n")
+    if #raw > (tonumber(Settings.heavy_beautify_limit) or 450000) then
+        return raw
+    end
     return darkluaBeautify(raw)
 end
 
+Settings._run = function()
 if Settings.ipt then
     local ok, err = pcall(function()
         if not fs.isFile(Settings.ipt) then
@@ -9445,49 +10815,49 @@ end
 while true do
     local input = stdio.readLine()
     if not input or input == "" then break end
-    local decoded = serde.decode("json", input)
-    local source = decoded.script
-
-    -- Auto-detect zstd magic bytes on raw input
-    local zstd_ok, zstd_mod = true, zstd_lib
-
-    if type(source) == "string" and zstd_ok and zstd_mod and zstd_mod.isZstd(source) then
-        local d, err = zstd_mod.decompress(source)
-        if d then source = d end
-    elseif type(source) == "string" and decoded.zstd_base64 == true then
-        -- decode base64 then decompress
-        if zstd_ok and zstd_mod then
-            -- Use net.urldecode or pure-Luau base64
-            local b64dec
-            local function b64decode(s)
-                local b = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    local requestId = "0"
+    local okRequest, requestErr = pcall(function()
+        local decoded = serde.decode("json", input)
+        requestId = tostring(decoded.id or "0")
+        local source = decoded.script
+        local zstd_ok, zstd_mod = true, zstd_lib
+        if type(source) == "string" and zstd_ok and zstd_mod and zstd_mod.isZstd(source) then
+            local d = zstd_mod.decompress(source)
+            if d then source = d end
+        elseif type(source) == "string" and decoded.zstd_base64 == true and zstd_ok and zstd_mod then
+            local function b64decode(value)
+                local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
                 local lookup = {}
-                for i = 1, #b do lookup[b:byte(i, i)] = i - 1 end
-                s = s:gsub("%s+", "")
-                local out = {}
+                for i = 1, #alphabet do lookup[alphabet:byte(i, i)] = i - 1 end
+                value = value:gsub("%s+", "")
+                local output = {}
+                local nout = 0
                 local i = 1
-                while i <= #s do
-                    local c1 = lookup[s:byte(i, i)] or 0
-                    local c2 = lookup[s:byte(i+1, i+1)] or 0
-                    local c3 = lookup[s:byte(i+2, i+2)] or 0
-                    local c4 = lookup[s:byte(i+3, i+3)] or 0
-                    local n = c1 * 262144 + c2 * 4096 + c3 * 64 + c4
-                    local b1 = math.floor(n / 65536) % 256
-                    local b2 = math.floor(n / 256) % 256
-                    local b3 = n % 256
-                    table.insert(out, string.char(b1, b2, b3))
+                while i <= #value do
+                    local c1 = lookup[value:byte(i, i)] or 0
+                    local c2 = lookup[value:byte(i + 1, i + 1)] or 0
+                    local c3 = lookup[value:byte(i + 2, i + 2)] or 0
+                    local c4 = lookup[value:byte(i + 3, i + 3)] or 0
+                    local packed = c1 * 262144 + c2 * 4096 + c3 * 64 + c4
+                    nout += 1
+                    output[nout] = string.char(math.floor(packed / 65536) % 256, math.floor(packed / 256) % 256, packed % 256)
                     i += 4
                 end
-                return table.concat(out)
+                return table.concat(output)
             end
-            local bin = b64decode(source)
-            local d = zstd_mod.decompress(bin)
+            local d = zstd_mod.decompress(b64decode(source))
             if d then source = d end
         end
+        if type(source) ~= "string" then error("invalid script payload", 0) end
+        stdio.write(dump(source))
+    end)
+    if not okRequest then
+        stdio.write("-- Worker error: " .. tostring(requestErr):sub(1, 1000))
     end
-
-    local result = dump(source)
-    stdio.write(result)
-    stdio.write("\n---END---\n")
+    stdio.write("\n---CADMIO_END:" .. requestId .. "---\n")
 end
  
+
+end
+Settings._run()
+Settings._run = nil
