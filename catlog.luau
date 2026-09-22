@@ -6971,11 +6971,9 @@ local function createEnv()
         if extra then
             for k, v in pairs(extra) do c[k] = v end
         end
-        return setmetatable(c, {
-            __newindex = function(_, k, v)
-                error("attempt to write to read-only library table", 2)
-            end
-        })
+        -- No metatable: allow writes so VM-based obfuscators that modify
+        -- library tables don't crash with "attempt to write to read-only"
+        return c
     end
     env.math = copyLib(math, {
         abs = function(x) if type(x) == "string" or type(x) == "boolean" or x == nil then error("bad argument #1 to 'abs' (number expected)", 2) end if type(x) ~= "number" then return 0 end return math.abs(x) end,
@@ -6997,7 +6995,7 @@ local function createEnv()
         acos = function(x) if x == nil then error("missing argument #1 to 'acos' (number expected)", 2) end if type(x) ~= "number" then return 0 end return math.acos(x) end,
         atan = function(x, y) if x == nil then error("missing argument #1 to 'atan' (number expected)", 2) end if type(x) ~= "number" then return 0 end if y then return math.atan(x, y) end return math.atan(x) end,
         atan2 = function(x, y) if x == nil then error("missing argument #1 to 'atan2' (number expected)", 2) end if y == nil then error("missing argument #2 to 'atan2' (number expected)", 2) end if type(x) ~= "number" or type(y) ~= "number" then return 0 end return math.atan2(x, y) end,
-        huge = math.huge, pi = math.pi, maxinteger = math.maxinteger, mininteger = math.mininteger,
+        huge = math.huge, pi = math.pi, maxinteger = 9223372036854775807, mininteger = -9223372036854775808,
         noise = function(x, y, z) return 0 end,
         randomseed = function(seed) math.randomseed(seed) end,
     })
@@ -7013,6 +7011,18 @@ local function createEnv()
     env.string = copyLib(string, {
         dump = function(f, strip)
             error("unable to dump given function", 2)
+        end,
+        startswith = function(s, prefix, init)
+            if type(s) ~= "string" then error("invalid argument #1 to 'startswith' (string expected)", 2) end
+            if type(prefix) ~= "string" then error("invalid argument #2 to 'startswith' (string expected)", 2) end
+            local start = init or 1
+            return s:sub(start, start + #prefix - 1) == prefix
+        end,
+        endswith = function(s, suffix, endpos)
+            if type(s) ~= "string" then error("invalid argument #1 to 'endswith' (string expected)", 2) end
+            if type(suffix) ~= "string" then error("invalid argument #2 to 'endswith' (string expected)", 2) end
+            local finish = endpos or #s
+            return s:sub(finish - #suffix + 1, finish) == suffix
         end,
     })
     registerCFunctions(env.string)
@@ -7486,76 +7496,30 @@ local function createEnv()
         end
         return table.unpack(results, 1, results.n)
     end
-    env.pcall = function(f, ...) if f == nil and select("#", ...) == 0 then error("missing argument #1 to 'pcall' (function expected)", 2) end return wrapPcall(f, ...) end
+    env.pcall = pcall
     local _inErrorHandler = false
-    env.xpcall = function(f, handler, ...) if f == nil and select("#", ...) == 0 then error("missing argument #1 to 'xpcall' (function expected)", 2) end
-        local results = table.pack(xpcall(
-            function(...) _inErrorHandler = false return f(...) end,
-            function(err)
-                _inErrorHandler = true
-                local ok, r = pcall(handler, err)
-                _inErrorHandler = false
-                if not ok then error(r, 0) end
-                return r
-            end,
-            ...
-        ))
-        local ok = results[1]
-        if not ok and type(results[2]) == "string" and results[2]:find("stack", 1, true) then
-            results[2] = "stack overflow"
-        end
-        return table.unpack(results, 1, results.n)
-    end
-    -- REAL bypass: env.error swallows anti-tamper error messages at RUNTIME
-    -- instead of textually patching the source. When a script does
+    env.xpcall = xpcall
     -- `error("tamper")` or `error("GET TF OUT BITCH SKID", 0)`, the call
     -- silently returns instead of raising, so execution continues past the
     -- anti-tamper check. Genuine errors with other messages propagate normally.
     --
     -- IMPORTANT: we only swallow KNOWN anti-tamper banner messages. Test
-    -- messages like "vanish-at-sentinel" or "test-err" or "expect" MUST
-    -- propagate, because the script uses them to verify pcall/xpcall works.
+    -- Anti-tamper error swallowing is DISABLED for universal VM support.
+    -- VM-based obfuscators use error/pcall for control flow. If we swallow
+    -- errors containing "tamper", "skid", etc., the VM's control flow breaks.
+    -- Anti-tamper bypass is done at source level (gsub) instead.
     local _realError = error
     env.error = function(msg, level)
-        if type(msg) == "string" then
-            local lower = msg:lower()
-            -- Anti-tamper / anti-skid error patterns — swallow at runtime.
-            if lower:find("tamper", 1, true)
-                or lower:find("get tf out", 1, true)
-                or lower:find("skid", 1, true)
-                or msg == "__skip__"
-                or lower:find("you are lost", 1, true)
-                or lower:find("holy dtc", 1, true)
-                or lower:find("holy pass", 1, true)
-                or lower:find("detected by", 1, true)
-                or lower:find("tampering detected", 1, true)
-            then
-                return -- swallow
-            end
-        end
-        if type(msg) == "table" and rawget(msg, "msg") then
-            local inner = tostring(rawget(msg, "msg"))
-            if inner:lower():find("tamper", 1, true) then
-                return -- swallow
-            end
-        end
         return _realError(msg, level)
     end
     env.assert = function(v, msg, ...)
         if not v then
-            if type(msg) == "string" then
-                local lower = msg:lower()
-                if lower:find("tamper", 1, true) or lower:find("skid", 1, true)
-                    or lower:find("get tf out", 1, true) then
-                    return -- swallow
-                end
-            end
             return _realError(msg or "assertion failed!")
         end
         return v, msg, ...
     end
     env.tonumber = tonumber; local tostringCounter = 0
-    env.tostring = function(v, ...) if v == nil and select("#", ...) == 0 then error("missing argument #1 to 'tostring' (value expected)", 2) end
+    env.tostring = function(v)
         if type(v) == "table" then
             local m = getmetatable(v)
             if m and m._isProxy then
@@ -7705,20 +7669,8 @@ local function createEnv()
             end
             mt._isReadonlyGuard = true
         end
-        -- Universal VM support: if the table doesn't have a __index,
-        -- add one that returns a callable proxy for missing keys.
-        -- This prevents "attempt to call a nil value" crashes in VM-based
-        -- obfuscators that index their function tables with opcodes.
-        if type(mt) == "table" and mt.__index == nil and type(t) == "table" then
-            mt.__index = function(tt, k)
-                local v = rawget(tt, k)
-                if v ~= nil then return v end
-                -- Return a callable proxy so t[missing_key]() doesn't crash
-                return function() return nil end
-            end
-        end
         return realSetmetatable(t, mt)
-    end; env.getmetatable = function(t, ...) if t == nil and select("#", ...) == 0 then error("missing argument #1 to 'getmetatable' (value expected)", 2) end
+    end; env.getmetatable = function(t)
         if type(t) == "string" then return nil end
         local raw_mt = getmetatable(t)
         if raw_mt and raw_mt.__metatable == false then return nil end
@@ -7818,7 +7770,7 @@ local function createEnv()
         end
         return t
     end
-    env.type = function(x, ...) if x == nil and select("#", ...) == 0 then error("missing argument #1 to 'type' (value expected)", 2) end
+    env.type = function(x)
         local t = type(x)
         if t == "table" then
             local m = getmetatable(x)
@@ -9673,15 +9625,6 @@ local _ncField = nil
     setmetatable(env, {
         __index = function(t, k)
             if hiddenFuncs[k] ~= nil then return hiddenFuncs[k] end
-            if existingEnvMt and existingEnvMt.__index then
-                if type(existingEnvMt.__index) == "function" then
-                    local v = existingEnvMt.__index(t, k)
-                    if v ~= nil then return v end
-                else
-                    local v = existingEnvMt.__index[k]
-                    if v ~= nil then return v end
-                end
-            end
             -- Known executor-specific APIs that should pass-through:
             -- `make_read_only(t)` should return t unchanged so chained
             -- calls like `make_read_only(t).field` work.
@@ -9699,14 +9642,9 @@ local _ncField = nil
                 _missingGlobalsSeen[k] = true
                 table.insert(_missingGlobalsLog, k)
             end
-            -- Return the chained stub so chained calls don't crash.
-            if type(k) == "string" and k:match("^[%a_][%w_]*$") and not _recording then
-                return _stub
-            end
-            if type(k) == "string" and k:match("^[%a_][%w_]*$") then
-                return makeProxy(k)
-            end
-            return _stub
+            -- Return a function that returns nil for missing globals.
+            -- This is critical for VM-based obfuscators that check return values.
+            return function() return nil end
         end,
         __newindex = function(t, k, v)
             if _recording then
@@ -9753,7 +9691,7 @@ local _ncField = nil
     local _lockedObjects = setmetatable({}, {__mode = "k"})
     local function _lockObj(obj) _lockedObjects[obj] = true end
 
-    env.type = function(v, ...) if v == nil and select("#", ...) == 0 then error("missing argument #1 to 'type' (value expected)", 2) end
+    env.type = function(v)
         local t = _orig_type(v)
         if t == "table" then
             local mt = getmetatable(v)
@@ -9818,7 +9756,7 @@ local _ncField = nil
     end
 
     local _orig_getmetatable = getmetatable
-    env.getmetatable = function(obj, ...) if obj == nil and select("#", ...) == 0 then error("missing argument #1 to 'getmetatable' (value expected)", 2) end
+    env.getmetatable = function(obj)
         if _lockedObjects[obj] then return "The metatable is locked" end
         local mt = _orig_getmetatable(obj)
         if mt and _orig_type(mt) == "table" then
@@ -10281,7 +10219,7 @@ local _ncField = nil
             if k == "tostring" then _orig_env_tostring = v break end
         end
     end
-    env.tostring = function(v, ...) if v == nil and select("#", ...) == 0 then error("missing argument #1 to 'tostring' (value expected)", 2) end
+    env.tostring = function(v)
         if _orig_type(v) == "table" then
             local mt = _orig_getmetatable(v)
             if _orig_type(mt) ~= "table" then
@@ -11711,10 +11649,11 @@ local function dump(source: string): string
     
     local loadOk, loadErr = pcall(function()
         local sourceSize = #processedSource
-        local optimizationLevel = sourceSize >= 262144 and 1 or 2
-        local prelude = hasChecksum and "" or SANDBOX_PRELUDE
-        local compiled = luau.compile(prelude .. processedSource, { optimizationLevel = optimizationLevel, debugLevel = 1 })
-        fn = luau.load(compiled, { debugName = "envlog" })
+        local optimizationLevel = 0  -- no optimization for VM compatibility
+        local prelude = ""  -- no prelude for VM compatibility
+        -- Use loadstring for maximum VM compatibility (avoids luau.compile
+        -- optimization issues with complex obfuscated code)
+        fn = loadstring(prelude .. processedSource, "envlog")
         setfenv(fn, env)
     end)
     if not loadOk or not fn then
@@ -11766,7 +11705,75 @@ local function dump(source: string): string
     _recording = true
     lines = {}
     lastEmitted = nil
+    -- DEBUG: Check source after processing
+    -- Try with full env first
+    setfenv(fn, env)
     local ok, err = xpcall(fn, _errHandler)
+    -- If the full env fails with "attempt to call a nil value", retry with
+    -- a minimal env. VM-based obfuscators often break with complex proxies.
+    if not ok and type(err) == "string" and err:find("attempt to call a nil value", 1, true) then
+        lines = {}
+        lastEmitted = nil
+        _recording = true
+        local _minEnv
+        _minEnv = {
+            string = string, table = table, math = math, bit32 = bit32,
+            coroutine = coroutine, os = os, utf8 = utf8, buffer = buffer,
+            type = type, typeof = typeof, tostring = tostring, tonumber = tonumber,
+            print = function(...)
+                local args = table.pack(...)
+                local parts = {}
+                for i = 1, args.n do parts[i] = tostring(args[i]) end
+                emit("print(" .. table.concat(parts, ", ") .. ")")
+            end,
+            warn = function(...)
+                local args = table.pack(...)
+                local parts = {}
+                for i = 1, args.n do parts[i] = tostring(args[i]) end
+                emit("warn(" .. table.concat(parts, ", ") .. ")")
+            end,
+            error = error, assert = assert,
+            pcall = pcall, xpcall = xpcall, select = select, unpack = table.unpack,
+            rawget = rawget, rawset = rawset, rawequal = rawequal, rawlen = rawlen,
+            setmetatable = setmetatable, getmetatable = getmetatable,
+            pairs = pairs, ipairs = ipairs, next = next,
+            getfenv = getfenv, setfenv = setfenv,
+            loadstring = function(src, name) local f = loadstring(src, name) if f then setfenv(f, _minEnv) end return f end,
+            load = function(src, name) local f = load(src, name) if f then setfenv(f, _minEnv) end return f end,
+            require = require,
+            collectgarbage = collectgarbage, gcinfo = gcinfo, newproxy = newproxy,
+            tick = function() return 0 end, time = function() return 0 end,
+            wait = function() return 0 end, spawn = function() end, delay = function() end,
+            task = task, version = function() return "0.728" end, _VERSION = "Luau",
+        }
+        _minEnv.game = setmetatable({}, {
+            __index = function(t, k)
+                if k == "HttpGet" then return function(self, url) return 'print("loaded from: " .. tostring(url))' end end
+                return function() return nil end
+            end,
+            __namecall = function(self, ...)
+                local method = ""
+                -- Try to detect the method name
+                return 'print("namecall")'
+            end,
+        })
+        _minEnv.workspace = _minEnv.game
+        _minEnv.script = setmetatable({}, {__index = function() return nil end})
+        _minEnv.Instance = {new = function() return setmetatable({}, {
+            __index = function() return function() return nil end end,
+            __newindex = function() end, __namecall = function() return nil end,
+        }) end}
+        _minEnv.Enum = setmetatable({}, {__index = function() return setmetatable({}, {__index = function() return {} end}) end})
+        _minEnv.Vector3 = {new = function() return {} end}
+        _minEnv.Vector2 = {new = function() return {} end}
+        _minEnv.CFrame = {new = function() return {} end}
+        _minEnv.Color3 = {new = function() return {} end}
+        _minEnv.UDim2 = {new = function() return {} end}
+        _minEnv.UDim = {new = function() return {} end}
+        setmetatable(_minEnv, {__index = function() return function() return nil end end})
+        setfenv(fn, _minEnv)
+        ok, err = xpcall(fn, _errHandler)
+    end
     _recording = false
     if not ok then
         local errStr = _caughtErr or tostring(err)
