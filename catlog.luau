@@ -7705,6 +7705,18 @@ local function createEnv()
             end
             mt._isReadonlyGuard = true
         end
+        -- Universal VM support: if the table doesn't have a __index,
+        -- add one that returns a callable proxy for missing keys.
+        -- This prevents "attempt to call a nil value" crashes in VM-based
+        -- obfuscators that index their function tables with opcodes.
+        if type(mt) == "table" and mt.__index == nil and type(t) == "table" then
+            mt.__index = function(tt, k)
+                local v = rawget(tt, k)
+                if v ~= nil then return v end
+                -- Return a callable proxy so t[missing_key]() doesn't crash
+                return function() return nil end
+            end
+        end
         return realSetmetatable(t, mt)
     end; env.getmetatable = function(t, ...) if t == nil and select("#", ...) == 0 then error("missing argument #1 to 'getmetatable' (value expected)", 2) end
         if type(t) == "string" then return nil end
