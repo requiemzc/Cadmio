@@ -1,0 +1,4 @@
+# deobf toolchain: artefactos generados
+__pycache__/
+*.pyc
+deobf/bin/*
