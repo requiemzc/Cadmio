@@ -3145,9 +3145,150 @@ E.setthreadidentity = function() end
 E.setidentity = function() end
 E.lz4compress = function(s) return s end
 E.lz4decompress = function(s) return s end
-E.crypt = { base64encode = function(s) return s end, base64decode = function(s) return s end }
-E.base64_encode = E.crypt.base64encode
-E.base64_decode = E.crypt.base64decode
+-- Real crypt.hash/base64 (pure Luau). FlowAuth-style loaders verify a native
+-- hash against the standard test vectors (sha256("abc") == ba7816bf... and
+-- the 448-bit vector) and base64 with "Rmxvd0F1dGgh" -> "FlowAuth!" before
+-- they proceed; the old identity stubs failed those checks and the loader
+-- aborted with "no verified native SHA-256 ...".
+do
+	local bxor, band, bor, bnot = bit32.bxor, bit32.band, bit32.bor, bit32.bnot
+	local lshift, rshift, rrotate = bit32.lshift, bit32.rshift, bit32.rrotate
+	local sub, byte, char, rep, format = string.sub, string.byte, string.char, string.rep, string.format
+	local concat = table.concat
+	local K = {
+		0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+		0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+		0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+		0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+		0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+		0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+		0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+		0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+	}
+	local function sha256hex(msg)
+		msg = R.type(msg) == "string" and msg or R.tostring(msg or "")
+		local len = #msg
+		local bits = len * 8
+		-- pad: 0x80, zeros to 56 mod 64, then 8-byte big-endian bit length
+		local pad = char(128) .. rep("\0", (55 - len) % 64)
+			.. char(0, 0, 0, 0, band(rshift(bits, 24), 255), band(rshift(bits, 16), 255), band(rshift(bits, 8), 255), band(bits, 255))
+		local data = msg .. pad
+		local H = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 }
+		local W = {}
+		for pos = 1, #data, 64 do
+			for i = 0, 15 do
+				local o = pos + i * 4
+				W[i + 1] = byte(data, o) * 16777216 + byte(data, o + 1) * 65536 + byte(data, o + 2) * 256 + byte(data, o + 3)
+			end
+			for i = 16, 63 do
+				local w15, w2, w16, w7 = W[i - 14], W[i - 1], W[i - 15], W[i - 6]
+				local s0 = bxor(bxor(rrotate(w15, 7), rrotate(w15, 18)), rshift(w15, 3))
+				local s1 = bxor(bxor(rrotate(w2, 17), rrotate(w2, 19)), rshift(w2, 10))
+				W[i + 1] = (s1 + w7 + s0 + w16) % 4294967296
+			end
+			local a, b, c, d, e, f, g, h = H[1], H[2], H[3], H[4], H[5], H[6], H[7], H[8]
+			for i = 1, 64 do
+				local w = W[i]
+				local S1 = bxor(bxor(rrotate(e, 6), rrotate(e, 11)), rrotate(e, 25))
+				local ch = bxor(band(e, f), band(bnot(e), g))
+				local t1 = (h + S1 + ch + K[i] + w) % 4294967296
+				local S0 = bxor(bxor(rrotate(a, 2), rrotate(a, 13)), rrotate(a, 22))
+				local maj = bxor(bxor(band(a, b), band(a, c)), band(b, c))
+				local t2 = (S0 + maj) % 4294967296
+				h, g, f, e, d, c, b, a = g, f, e, (d + t1) % 4294967296, c, b, a, (t1 + t2) % 4294967296
+			end
+			H[1], H[2], H[3], H[4] = (H[1] + a) % 4294967296, (H[2] + b) % 4294967296, (H[3] + c) % 4294967296, (H[4] + d) % 4294967296
+			H[5], H[6], H[7], H[8] = (H[5] + e) % 4294967296, (H[6] + f) % 4294967296, (H[7] + g) % 4294967296, (H[8] + h) % 4294967296
+		end
+		local out = {}
+		for i = 1, 8 do
+			out[i] = format("%08x", H[i])
+		end
+		return concat(out)
+	end
+	local B64A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	local B64D = {}
+	for i = 1, #B64A do
+		B64D[byte(B64A, i)] = i - 1
+	end
+	local function b64encode(s)
+		s = R.type(s) == "string" and s or R.tostring(s or "")
+		local out = {}
+		local n = 0
+		local len = #s
+		for i = 1, len, 3 do
+			local b1 = byte(s, i)
+			local b2 = byte(s, i + 1)
+			local b3 = byte(s, i + 2)
+			n = n + 1
+			out[n] = sub(B64A, (b1 // 4) + 1, (b1 // 4) + 1)
+			local mid = b2 and (b1 % 4) * 16 + (b2 // 16) or (b1 % 4) * 16
+			n = n + 1
+			out[n] = sub(B64A, mid + 1, mid + 1)
+			if b2 then
+				local low = b3 and (b2 % 16) * 4 + (b3 // 64) or (b2 % 16) * 4
+				n = n + 1
+				out[n] = sub(B64A, low + 1, low + 1)
+			else
+				n = n + 1
+				out[n] = "="
+			end
+			if b3 then
+				n = n + 1
+				out[n] = sub(B64A, (b3 % 64) + 1, (b3 % 64) + 1)
+			else
+				n = n + 1
+				out[n] = "="
+			end
+		end
+		return concat(out)
+	end
+	local function b64decode(s)
+		s = R.type(s) == "string" and s or ""
+		s = s:gsub("[^%w%+%/%=]", "")
+		s = s:gsub("=+$", "")
+		local out = {}
+		local n = 0
+		local len = #s
+		for i = 1, len, 4 do
+			local a = B64D[byte(s, i)] or 0
+			local b = B64D[byte(s, i + 1)] or 0
+			local c = B64D[byte(s, i + 2)]
+			local d = B64D[byte(s, i + 3)]
+			n = n + 1
+			out[n] = char(a * 4 + (b // 16))
+			if c then
+				n = n + 1
+				out[n] = char((b % 16) * 16 + (c // 4))
+				if d then
+					n = n + 1
+					out[n] = char((c % 4) * 64 + d)
+				end
+			end
+		end
+		return concat(out)
+	end
+	local function normAlgo(algo)
+		if R.type(algo) ~= "string" then return "sha256" end
+		algo = R.lower(R.gsub(algo, "[^%a%d]", ""))
+		return algo
+	end
+	E.crypt = {
+		hash = function(data, algo)
+			if normAlgo(algo) == "sha256" then
+				return sha256hex(data)
+			end
+			return nil, "crypt.hash: unsupported algorithm '" .. R.tostring(algo) .. "'"
+		end,
+		sha256 = function(data) return sha256hex(data) end,
+		base64encode = b64encode,
+		base64decode = b64decode,
+		base64_encode = b64encode,
+		base64_decode = b64decode,
+	}
+	E.base64_encode = E.crypt.base64encode
+	E.base64_decode = E.crypt.base64decode
+end
 E.Drawing = { new = function(kind) return callP("Drawing.new(" .. fmt(kind) .. ")", R.type(kind) == "string" and kind or "drawing") end }
 E.isrbxactive = function() return true end
 E.isgameactive = function(...) return E.isrbxactive(...) end

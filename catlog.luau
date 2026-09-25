@@ -8212,6 +8212,12 @@ local function createEnv()
     end
     env.Vector3 = newCtor("Vector3")
     env.Vector2 = newCtor("Vector2")
+    -- Native Luau vector library (vector.create/dot/cross/...). Luraph and
+    -- FlowAuth-style loaders probe it during boot (Roblox: Vector3 *is* the
+    -- native vector type). Lune exposes the stock Luau `vector` global; the
+    -- metatable is frozen (Dot/Magnitude as members are not available), but
+    -- construction/arithmetic/comparisons all work.
+    env.vector = vector
     local function normalize3(x, y, z)
         local m = math.sqrt(x * x + y * y + z * z)
         if m == 0 then return 0, 0, 0 end
@@ -9706,6 +9712,7 @@ local _ncField = nil
     env.typeof = function(v)
         if v == nil then return "nil" end
         local t = _orig_type(v)
+        if t == "vector" then return "Vector3" end -- Roblox: native vector == Vector3
         if t == "table" then
             local mt = getmetatable(v)
             if mt and _orig_type(mt) == "table" then
@@ -10406,6 +10413,12 @@ local _ncField = nil
     env.dofile = nil
 
     env.http_request = function(opts)
+        -- offline=true: never touch the network (dead servers hang lune's
+        -- net.request for minutes; FlowAuth-style loaders retry every
+        -- candidate function). The script sees an unreachable server.
+        if Settings.offline then
+            return {StatusCode=0, Body="", Success=false, Headers={}}
+        end
         if type(opts) ~= "table" then return {StatusCode=400, Body="", Success=false} end
         local url = opts.Url or opts.url
         if url and (url:find("^https?://") or url:find("^rbxasset://")) then
@@ -10422,6 +10435,7 @@ local _ncField = nil
     env.request = env.http_request
     env.httppost = env.http_request
     env.httpget = function(url)
+        if Settings.offline then return "" end
         if type(url) == "string" and (url:find("^https?://") or url:find("^rbxasset://")) then
             local ok, res = pcall(net.request, url)
             if ok and res and res.statusCode == 200 and res.body then
