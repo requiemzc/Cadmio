@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 deobf/bin/*
+
+# binaries are built/downloaded here (deobf/bin/readme.txt stays)
+!deobf/bin/readme.txt
