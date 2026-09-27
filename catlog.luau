@@ -5802,6 +5802,35 @@ makeProxy = function(name: string): any
             return tostring(_G._debugIdCounter)
         end
 
+        if isMethod and (fieldName == "IsDescendantOf" or fieldName == "IsAncestorOf") and parent then
+            local parentName = proxyName(parent)
+            local arg = args[startIdx]
+            local argName = isProxy(arg) and proxyName(arg) or serialize(arg)
+            emit(string.format('local %s = %s:%s(%s)', retName, parentName, fieldName, argName))
+            if fieldName == "IsDescendantOf" then
+                -- walk parent chain of `parent` (self) looking for `arg`
+                if not isProxy(arg) then return false end
+                local cur = getmetatable(parent)._storedValues and getmetatable(parent)._storedValues["Parent"] or nil
+                while cur ~= nil and isProxy(cur) do
+                    if rawequal(cur, arg) then return true end
+                    local cm = getmetatable(cur)
+                    cur = cm and cm._storedValues and cm._storedValues["Parent"] or nil
+                end
+                -- also accept game proxy as ancestor root
+                if isProxy(arg) and getmetatable(arg)._className == "DataModel" then return true end
+                return false
+            else -- IsAncestorOf
+                if not isProxy(arg) then return false end
+                local cur = getmetatable(arg)._storedValues and getmetatable(arg)._storedValues["Parent"] or nil
+                while cur ~= nil and isProxy(cur) do
+                    if rawequal(cur, parent) then return true end
+                    local cm = getmetatable(cur)
+                    cur = cm and cm._storedValues and cm._storedValues["Parent"] or nil
+                end
+                return false
+            end
+        end
+
         if isMethod and (fieldName == "PreloadAsync" or fieldName == "SendKeyEvent" or fieldName == "SendMouseButtonEvent" or fieldName == "SendMouseMoveEvent") and parent then
             local parentName = proxyName(parent)
             emit(string.format('%s:%s(%s)', parentName, fieldName, table.concat(parts, ", ")))
@@ -10127,10 +10156,31 @@ local _ncField = nil
             return nil
         end)
         local _clockTime = 14
+        local _lightingTechnology = (function()
+            local ei = makeProxy("Lighting.Technology")
+            local eimt = _orig_getmetatable(ei)
+            eimt._className = "EnumItem"
+            eimt._ctorName = "EnumItem"
+            eimt.__type = "EnumItem"
+            eimt._storedValues["Name"] = "Future"
+            eimt._setKeys["Name"] = true
+            eimt._storedValues["Value"] = 4
+            eimt._setKeys["Value"] = true
+            eimt._storedValues["EnumType"] = "Technology"
+            eimt._setKeys["EnumType"] = true
+            return ei
+        end)()
+        _threadIdentity = 7
         _patchProxyIndex(_game_proxy:GetService("Lighting"), function(self, k)
             if k == "GetMinutesAfterMidnight" then return function() return _clockTime * 60 end end
             if k == "SetMinutesAfterMidnight" then return function(self, m) _clockTime = m / 60 end end
             if k == "ClockTime" then return _clockTime end
+            if k == "Technology" then
+                if _threadIdentity < 2 then
+                    error("The current thread cannot read 'Technology' (lacking permission level RobloxScript)", 0)
+                end
+                return _lightingTechnology
+            end
             return nil
         end)
         local _memData = {}
@@ -10147,6 +10197,29 @@ local _ncField = nil
             return nil
         end)
         _patchProxyIndex(_game_proxy:GetService("SoundService"), function(self, k) if k == "DistanceFactor" then return 3.51 end return nil end)
+        local _encryptedAssets = {}
+        _patchProxyIndex(_game_proxy:GetService("ContentProvider"), function(self, k)
+            if k == "RegisterEncryptedAsset" then
+                return function(self, assetId, key)
+                    _encryptedAssets[tostring(assetId)] = tostring(key)
+                end
+            end
+            if k == "UnregisterEncryptedAsset" then
+                return function(self, assetId)
+                    _encryptedAssets[tostring(assetId)] = nil
+                end
+            end
+            if k == "ListEncryptedAssets" then
+                return function(self)
+                    local result = {}
+                    for assetId, _ in pairs(_encryptedAssets) do
+                        table.insert(result, assetId)
+                    end
+                    return result
+                end
+            end
+            return nil
+        end)
         _patchProxyIndex(_game_proxy:GetService("RunService"), function(self, k)
             if k == "Heartbeat" or k == "RenderStepped" or k == "Stepped" then
                 local signal = makeProxy("RBXScriptSignal")
@@ -10342,9 +10415,9 @@ local _ncField = nil
     env.isLfunction = env.islclosure
     env.isCfunction = env.iscclosure
 
-    env.getthreadidentity = function() return 7 end
-    env.setthreadidentity = function(id) end
-    env.getidentity = function() return 7 end
+    env.getthreadidentity = function() return _threadIdentity end
+    env.setthreadidentity = function(id) _threadIdentity = tonumber(id) or 7 end
+    env.getidentity = function() return _threadIdentity end
     env.getthread = function() return coroutine.running() end
     -- REAL bypass: checkcaller() returns false (we are NOT an executor hook
     -- thread; we are the script's own thread). Anti-tamper checks like
@@ -11420,11 +11493,14 @@ local function darkluaBeautify(source: string): string
     return customBeautify(source)
 end
 
+local _threadIdentity = 7
+
 local function dump(source: string): string
     lines = {}
     varCount = 0
     usedVars = {}
     opCount = 0
+    _threadIdentity = 7
     lastFlushCount = 0
     nextFlushCount = PARTIAL_FLUSH_INTERVAL
     lastEmitted = nil
@@ -11663,12 +11739,9 @@ local function dump(source: string): string
     
     local loadOk, loadErr = pcall(function()
         local sourceSize = #processedSource
-        local optimizationLevel = 0  -- no optimization for VM compatibility
-        local prelude = ""  -- no prelude for VM compatibility
-        -- Use loadstring for maximum VM compatibility (avoids luau.compile
-        -- optimization issues with complex obfuscated code)
-        fn = loadstring(prelude .. processedSource, "envlog")
-        setfenv(fn, env)
+        local optimizationLevel = sourceSize >= 262144 and 1 or 2
+        local compiled = luau.compile(SANDBOX_PRELUDE .. processedSource, { optimizationLevel = optimizationLevel, debugLevel = 1 })
+        fn = luau.load(compiled, { debugName = "envlog", environment = env })
     end)
     if not loadOk or not fn then
         emit(string.format("-- Load error: %s", tostring(loadErr):sub(1, 200)))
